@@ -298,3 +298,11 @@ After waking Grok, the bridge posts a short threaded reply so the channel is not
 
 Real answers still need human approval before a substantive `chat.postMessage`. Set `HOLD_ACK=false` to disable. Template: this repo's `index.js`.
 
+## Owner share allowlist
+
+1. Copy `OWNER_SHARE_POLICY.example.md` → `OWNER_SHARE_POLICY.md` next to the live bridge (or manage only in Grok memory).
+2. Tell your Grok Bot the initial allow/deny entries; it should save memory + the file.
+3. Set `OWNER_DISPLAY_NAME` in `.env` so hold-ack names you.
+4. Point the messenger routine at: consult allowlist before send; default deny; ask before expanding the list.
+5. Owners manage the list in chat (`add` / `remove` / `don't share X`). See README "Owner share allowlist".
+

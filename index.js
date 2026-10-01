@@ -5,7 +5,7 @@
  * Required env: SLACK_BOT_TOKEN, SLACK_APP_TOKEN, GROK_WEBHOOK_URL
  * Optional: SLACK_SIGNING_SECRET, GROK_WEBHOOK_SECRET, BRIDGE_SOURCE,
  *           THINKING_TIMEOUT_MS (default 45000), HOLD_ACK (default "true"),
- *           HOLD_ACK_BROADCAST (default "true")
+ *           HOLD_ACK_BROADCAST (default "true"), OWNER_DISPLAY_NAME (default "the owner")
  *
  * Ack model: Bolt acks a Socket Mode event when this listener's Promise settles.
  * Never await the Grok webhook (or other slow work) before returning - fire it
@@ -27,6 +27,7 @@ for (const key of required) {
 
 const BRIDGE_SOURCE = process.env.BRIDGE_SOURCE || "slack-grok-bridge";
 const HOLD_ACK = String(process.env.HOLD_ACK || "true").toLowerCase() !== "false";
+const OWNER_DISPLAY_NAME = process.env.OWNER_DISPLAY_NAME || "the owner";
 const HOLD_ACK_BROADCAST = String(process.env.HOLD_ACK_BROADCAST || "true").toLowerCase() !== "false";
 const THINKING_TIMEOUT_MS = Number(process.env.THINKING_TIMEOUT_MS || 45000);
 
@@ -51,9 +52,9 @@ const PERSONAL_RE =
   /\b(REDACTED|REDACTED|REDACTED|\bmax\b|REDACTED|kids?|child|daughter|son|family|school|calendar|schedule|class(?:es)?|piano|sewing|gymnastics|art class|pickup|carpool|address|home|phone|email|where (?:is|are)|what time|taking)\b/i;
 
 const HOLD_ACK_GENERIC =
-  "Got it — checking with the owner and will get back to you.";
+  `Got it - checking with ${OWNER_DISPLAY_NAME} and will get back to you.`;
 const HOLD_ACK_PERSONAL =
-  "That's not on my approved list of things to share publicly. Let me check with the owner and get back to you.";
+  `That's not on my approved list of things to share publicly. Let me check with ${OWNER_DISPLAY_NAME} and get back to you.`;
 
 async function resolveUser(client, userId) {
   if (!userId) return null;

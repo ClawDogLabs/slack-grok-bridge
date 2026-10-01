@@ -114,3 +114,44 @@ Invite the bot into channels with `/invite @YourBotDisplayName`.
 
 - Collect `xoxb` then `xapp` via **secret-request** only — never paste tokens in chat, never open them in vim/nano for the session log
 - Never commit `.env`, `bridge.pid`, `bridge.log`, or `node_modules` (see `.gitignore`)
+
+## Owner share allowlist (Grok-managed)
+
+Hold-ack is only UX. What the bot may **answer without asking again** is an **owner-specific allowlist** kept by that owner's Grok Bot.
+
+### Principles
+
+- **User-dependent.** Never copy another owner's list.
+- **Default deny.** Anything not on the allowlist needs human approval before a substantive public reply.
+- **Allowlist hit.** If the ask matches and the answer stays inside the listed bounds, the bot may reply and send without a new approval.
+- **Expand only on explicit OK.** One-off "post that" does not auto-add; ask once whether to add the topic.
+
+### Where it lives
+
+1. Grok Bot durable memory (source of truth for decisions).
+2. Optional `OWNER_SHARE_POLICY.md` beside the live bridge (keep in sync with memory).
+3. Template: `OWNER_SHARE_POLICY.example.md` in this repo.
+
+### How the owner manages it
+
+Talk to the Grok Bot in chat:
+
+| Say | Effect |
+| --- | --- |
+| `Add X to the share allowlist (bounds: …)` | Adds an allow entry |
+| `Remove X` / `Don't share X anymore` | Removes it immediately |
+| `You can answer Y without asking first` | Same as add |
+| Approve a one-off reply | Bot asks once whether to add for next time |
+
+After each change the bot should confirm the full short list.
+
+### Bridge knobs (not the allowlist)
+
+| Env | Role |
+| --- | --- |
+| `OWNER_DISPLAY_NAME` | Name used in hold-ack text (default `the owner`) |
+| `HOLD_ACK` | Instant threaded ack after webhook (default on) |
+| `HOLD_ACK_BROADCAST` | Also send hold-ack to channel (default on) |
+
+The allowlist itself is **not** an env secret; the agent owns it.
+
