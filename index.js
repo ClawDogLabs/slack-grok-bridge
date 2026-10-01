@@ -1,12 +1,19 @@
 /**
  * Slack Socket Mode → Grok inbound webhook bridge (template).
- * Listens for app mentions / DMs / messages and POSTs a short payload to a Grok inbound webhook.
+ * Listens for app mentions / DMs and POSTs a short payload to a Grok inbound webhook.
  *
  * Required env: SLACK_BOT_TOKEN, SLACK_APP_TOKEN, GROK_WEBHOOK_URL
+ * Optional: SLACK_SIGNING_SECRET, GROK_WEBHOOK_SECRET, BRIDGE_SOURCE,
+ *           THINKING_TIMEOUT_MS (default 45000), HOLD_ACK (default "true"),
+ *           HOLD_ACK_BROADCAST (default "true")
  *
  * Ack model: Bolt acks a Socket Mode event when this listener's Promise settles.
  * Never await the Grok webhook (or other slow work) before returning - fire it
  * after a fast thinking status so Slack does not retry (3s) and duplicate wakes.
+ *
+ * After a successful webhook wake, post an instant threaded hold-ack so the room
+ * knows the bot heard them while the human owner reviews. Personal/family asks
+ * get a stronger privacy hold message.
  */
 const { App } = require("@slack/bolt");
 
@@ -18,6 +25,11 @@ for (const key of required) {
   }
 }
 
+const BRIDGE_SOURCE = process.env.BRIDGE_SOURCE || "slack-grok-bridge";
+const HOLD_ACK = String(process.env.HOLD_ACK || "true").toLowerCase() !== "false";
+const HOLD_ACK_BROADCAST = String(process.env.HOLD_ACK_BROADCAST || "true").toLowerCase() !== "false";
+const THINKING_TIMEOUT_MS = Number(process.env.THINKING_TIMEOUT_MS || 45000);
+
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   appToken: process.env.SLACK_APP_TOKEN,
@@ -26,12 +38,22 @@ const app = new App({
 });
 
 const userCache = new Map();
+const thinkingTimers = new Map();
 
 const LOADING_MESSAGES = [
-  "checking the schedule…",
+  "checking with the owner…",
   "asking Grok…",
   "almost there…",
 ];
+
+// Heuristic only: stronger hold when the ask looks personal / family / schedule.
+const PERSONAL_RE =
+  /\b(REDACTED|REDACTED|REDACTED|\bmax\b|REDACTED|kids?|child|daughter|son|family|school|calendar|schedule|class(?:es)?|piano|sewing|gymnastics|art class|pickup|carpool|address|home|phone|email|where (?:is|are)|what time|taking)\b/i;
+
+const HOLD_ACK_GENERIC =
+  "Got it — checking with the owner and will get back to you.";
+const HOLD_ACK_PERSONAL =
+  "That's not on my approved list of things to share publicly. Let me check with the owner and get back to you.";
 
 async function resolveUser(client, userId) {
   if (!userId) return null;
@@ -98,6 +120,14 @@ function threadTsFor(event) {
   return event.thread_ts || event.ts;
 }
 
+function thinkingKey(channel, threadTs) {
+  return `${channel}:${threadTs}`;
+}
+
+function looksPersonal(text) {
+  return PERSONAL_RE.test(String(text || ""));
+}
+
 async function setThinking(client, channel, threadTs, logger) {
   if (!channel || !threadTs) return;
   try {
@@ -107,6 +137,16 @@ async function setThinking(client, channel, threadTs, logger) {
       status: "is thinking…",
       loading_messages: LOADING_MESSAGES,
     });
+    const key = thinkingKey(channel, threadTs);
+    const prev = thinkingTimers.get(key);
+    if (prev) clearTimeout(prev);
+    thinkingTimers.set(
+      key,
+      setTimeout(() => {
+        thinkingTimers.delete(key);
+        void clearThinking(client, channel, threadTs, logger);
+      }, THINKING_TIMEOUT_MS)
+    );
   } catch (err) {
     logger?.warn?.("assistant.threads.setStatus failed", err?.data?.error || err?.message || err);
   }
@@ -114,6 +154,12 @@ async function setThinking(client, channel, threadTs, logger) {
 
 async function clearThinking(client, channel, threadTs, logger) {
   if (!channel || !threadTs) return;
+  const key = thinkingKey(channel, threadTs);
+  const prev = thinkingTimers.get(key);
+  if (prev) {
+    clearTimeout(prev);
+    thinkingTimers.delete(key);
+  }
   try {
     await client.assistant.threads.setStatus({
       channel_id: channel,
@@ -125,10 +171,25 @@ async function clearThinking(client, channel, threadTs, logger) {
   }
 }
 
+async function postHoldAck(client, channel, threadTs, text, logger) {
+  if (!HOLD_ACK || !channel || !threadTs) return;
+  const body = looksPersonal(text) ? HOLD_ACK_PERSONAL : HOLD_ACK_GENERIC;
+  try {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: body,
+      reply_broadcast: HOLD_ACK_BROADCAST,
+    });
+  } catch (err) {
+    logger?.warn?.("hold-ack post failed", err?.data?.error || err?.message || err);
+  }
+}
+
 /**
  * Slow path: resolve user, wake Grok. Runs AFTER the Bolt listener returns (ack).
- * Status clears automatically when a later chat.postMessage lands in-thread;
- * we only clear explicitly on webhook failure.
+ * Clear thinking as soon as the webhook is accepted, then post an instant hold-ack
+ * so the room is not left on a forever spinner while the owner reviews.
  */
 async function processInbound({ kind, event, client, logger, sayOnFail }) {
   const channel = event.channel;
@@ -136,10 +197,13 @@ async function processInbound({ kind, event, client, logger, sayOnFail }) {
   try {
     const slack = await summarizeEvent(client, event);
     await wakeGrok({
-      source: "slack-grok-bridge",
+      source: BRIDGE_SOURCE,
       kind,
       slack,
+      hold_ack: looksPersonal(slack.text) ? "personal" : "generic",
     });
+    await clearThinking(client, channel, threadTs, logger);
+    await postHoldAck(client, channel, threadTs, slack.text, logger);
   } catch (err) {
     logger.error(err);
     await clearThinking(client, channel, threadTs, logger);
@@ -157,13 +221,11 @@ async function processInbound({ kind, event, client, logger, sayOnFail }) {
 }
 
 app.event("app_mention", async ({ event, say, client, logger }) => {
-  // Loop guard: ignore our own / other bot chatter if it ever arrives here
   if (event.bot_id || event.subtype === "bot_message") return;
 
   logger.info("app_mention", event.channel, event.user);
   const threadTs = threadTsFor(event);
 
-  // Fast path before ack settles: show spinner, then return.
   await setThinking(client, event.channel, threadTs, logger);
 
   void processInbound({
@@ -176,9 +238,7 @@ app.event("app_mention", async ({ event, say, client, logger }) => {
 });
 
 app.message(async ({ message, client, logger }) => {
-  // Skip bot messages and subtypes we do not care about (loop prevention)
   if (message.subtype || message.bot_id) return;
-  // In channels, prefer app_mention; still forward DMs
   if (message.channel_type !== "im" && message.channel_type !== "mpim") return;
 
   logger.info("dm/mpim", message.channel, message.user);
@@ -197,5 +257,7 @@ app.message(async ({ message, client, logger }) => {
 
 (async () => {
   await app.start();
-  console.log("⚡️ slack-grok-bridge running (Socket Mode; ack-first + thinking status)");
+  console.log(
+    `⚡️ ${BRIDGE_SOURCE} running (Socket Mode; ack-first + thinking + hold-ack)`
+  );
 })();

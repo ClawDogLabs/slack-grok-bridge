@@ -90,13 +90,19 @@ Do not leave `npm start` in a foreground desktop terminal; closing that session 
 ## Ack + thinking status
 
 Bolt acks Socket Mode events when the listener Promise settles. This process:
-1. Calls `assistant.threads.setStatus` (`is thinking…` + rotating loading messages) immediately
+1. Shows a short `is thinking…` status
 2. Returns so Slack gets the ack within the 3s window
 3. Resolves the user + POSTs the Grok webhook in the background
+4. Clears the spinner as soon as the webhook is accepted
+5. Posts an instant threaded **hold-ack** so the room knows the bot heard them while the owner reviews
 
-Webhook payload `source` defaults to `slack-grok-bridge` (change it in `index.js` to identify your fork if you want). Auth headers (when `GROK_WEBHOOK_SECRET` is set): `Authorization: Bearer …` and `X-Automation-Key`.
+Hold-ack text:
+- Generic: "Got it — checking with the owner and will get back to you."
+- Personal/family heuristic (kids, schedule, school, address, etc.): "That's not on my approved list of things to share publicly. Let me check with the owner and get back to you."
 
-The spinner clears when a later `chat.postMessage` lands in-thread (or on webhook failure). Needs `chat:write` (already required for replies).
+Env knobs: `HOLD_ACK` (default true), `HOLD_ACK_BROADCAST` (default true; Also send to channel), `THINKING_TIMEOUT_MS` (default 45000 safety clear), `BRIDGE_SOURCE` (payload `source` field).
+
+A later approved `chat.postMessage` is the real answer. Needs `chat:write`.
 
 ## Outbound replies
 

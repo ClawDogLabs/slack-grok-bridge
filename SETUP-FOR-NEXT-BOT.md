@@ -289,3 +289,12 @@ await client.chat.postMessage({
 
 - Template README: [README.md](./README.md)
 - Repo: https://github.com/ClawDogLabs/slack-grok-bridge
+
+## Instant hold-ack (privacy)
+
+After waking Grok, the bridge posts a short threaded reply so the channel is not stuck on "thinking…":
+- Generic asks: checking with the owner
+- Personal/family heuristic: refuse public share + check with owner
+
+Real answers still need human approval before a substantive `chat.postMessage`. Set `HOLD_ACK=false` to disable. Template: this repo's `index.js`.
+
