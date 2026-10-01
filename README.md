@@ -1,0 +1,83 @@
+# slack-grok-bridge
+
+Always-on Socket Mode bridge template: Slack events → POST to a Grok inbound webhook → your bot replies via Slack Web API.
+
+**Target Slack workspace:** [ClawDogLabs](https://clawdoglabs.slack.com) (or your workspace of choice — tokens and webhook are always per-bot).
+
+**Handoff for other Grok Bots:** see [`SETUP-FOR-NEXT-BOT.md`](./SETUP-FOR-NEXT-BOT.md) (ClawDogLabs manifest, secret-request, keep-alive, reboot recovery, `reply_broadcast`).
+
+## Clone path (each person)
+
+Each person's Grok Bot clones **this** repo to their own path — **not** someone else's working tree:
+
+```bash
+cd /workspace
+git clone git@github.com:ClawDogLabs/slack-grok-bridge.git slack-<theirbot>-bridge
+# or: https://github.com/ClawDogLabs/slack-grok-bridge.git
+cd /workspace/slack-<theirbot>-bridge
+```
+
+Example: bot display name `Gna` → `/workspace/slack-gna-bridge`. Never reuse another person's `.env`, tokens, or `GROK_WEBHOOK_URL`.
+
+## On Grok computer
+
+```bash
+cd /workspace/slack-<yourbot>-bridge
+cp .env.example .env && chmod 600 .env
+# Fill tokens via secret-request — never paste secrets in chat
+# Required: SLACK_BOT_TOKEN, SLACK_APP_TOKEN, GROK_WEBHOOK_URL
+# Optional: SLACK_SIGNING_SECRET, GROK_WEBHOOK_SECRET
+npm install
+./start.sh          # refuses to start if required env vars are empty
+```
+
+## Slack app checklist (Socket Mode)
+
+1. Socket Mode enabled
+2. App-Level Token with `connections:write` → `SLACK_APP_TOKEN` (`xapp-...`)
+3. Bot User OAuth Token → `SLACK_BOT_TOKEN` (`xoxb-...`)
+4. Bot token scopes (typical): `app_mentions:read`, `chat:write`, `im:history`, `im:read`, `channels:history` (as needed), `users:read`
+5. Subscribe to bot events: `app_mention`, `message.im` (add channel events only if you want them)
+6. Reinstall app to the **ClawDogLabs** workspace after scope changes
+7. Point `GROK_WEBHOOK_URL` at **this** agent's inbound webhook (not anyone else's)
+8. `bot_user.display_name` must be **ASCII** and match To:/@picker (no accents)
+9. Manifest fields (`name` / `description` / `long_description` / `background_color`) are **user-dependent** — confirm display name with the human first; `background_color` does **not** need to match anyone else's
+
+## Keep it running (no open terminal)
+
+This box has no systemd. Use detached scripts + a Grok routine:
+
+```bash
+cd /workspace/slack-<yourbot>-bridge
+./start.sh          # nohup + bridge.pid + bridge.log
+./stop.sh
+./ensure-running.sh # start if down; npm install if modules missing
+```
+
+After [Update Grok Bot's Computer](grokbot://app/v1/settings?id=update-computer), `/workspace` and `.env` usually survive, but `node_modules` may need `npm install`. The ensure routine reinstalls when missing and starts the bridge.
+
+**Socket Mode does not replay missed events.** After restart, smoke-test with an `@mention`. Prefer short keep-alive intervals (`ensure-running`).
+
+Do not leave `npm start` in a foreground desktop terminal; closing that session kills Socket Mode.
+
+## Ack + thinking status
+
+Bolt acks Socket Mode events when the listener Promise settles. This process:
+1. Calls `assistant.threads.setStatus` (`is thinking…` + rotating loading messages) immediately
+2. Returns so Slack gets the ack within the 3s window
+3. Resolves the user + POSTs the Grok webhook in the background
+
+Webhook payload `source` defaults to `slack-grok-bridge` (change it in `index.js` to identify your fork if you want). Auth headers (when `GROK_WEBHOOK_SECRET` is set): `Authorization: Bearer …` and `X-Automation-Key`.
+
+The spinner clears when a later `chat.postMessage` lands in-thread (or on webhook failure). Needs `chat:write` (already required for replies).
+
+## Outbound replies
+
+Human ack before send unless standing permission. Use `chat.postMessage` with `channel` + `thread_ts`. For channel-visible thread replies (Slack UI “Also send to #channel”), set **`reply_broadcast: true`** on that message — it is a **per-message** API flag, not a YAML/manifest setting.
+
+Invite the bot into channels with `/invite @YourBotDisplayName`.
+
+## Secrets
+
+- Collect `xoxb` then `xapp` via **secret-request** only — never paste tokens in chat, never open them in vim/nano for the session log
+- Never commit `.env`, `bridge.pid`, `bridge.log`, or `node_modules` (see `.gitignore`)
