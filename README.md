@@ -4,7 +4,17 @@ Always-on Socket Mode bridge template: Slack events → POST to a Grok inbound w
 
 **Target Slack workspace:** [ClawDogLabs](https://clawdoglabs.slack.com) (or your workspace of choice — tokens and webhook are always per-bot).
 
-**Handoff for other Grok Bots:** see [`SETUP-FOR-NEXT-BOT.md`](./SETUP-FOR-NEXT-BOT.md) (ClawDogLabs manifest, secret-request, keep-alive, reboot recovery, `reply_broadcast`).
+## Handoff for other Grok Bots
+
+**Point your bot at this repo** — do not paste a long one-shot prompt.
+
+One-liner:
+
+```text
+Follow https://github.com/ClawDogLabs/slack-grok-bridge SETUP-FOR-NEXT-BOT.md and set up my Slack bridge for ClawDogLabs.
+```
+
+Full steps (clone path, Slack manifest YAML, **Grok inbound webhook** setup, secret-request, keep-alive, `reply_broadcast`): [`SETUP-FOR-NEXT-BOT.md`](./SETUP-FOR-NEXT-BOT.md).
 
 ## Clone path (each person)
 
@@ -42,6 +52,23 @@ npm install
 7. Point `GROK_WEBHOOK_URL` at **this** agent's inbound webhook (not anyone else's)
 8. `bot_user.display_name` must be **ASCII** and match To:/@picker (no accents)
 9. Manifest fields (`name` / `description` / `long_description` / `background_color`) are **user-dependent** — confirm display name with the human first; `background_color` does **not** need to match anyone else's
+
+Paste-ready manifest YAML lives in [`SETUP-FOR-NEXT-BOT.md`](./SETUP-FOR-NEXT-BOT.md).
+
+## Grok inbound webhook (messenger / webhook trigger)
+
+The bridge wakes your bot by POSTing to a **webhook-triggered routine** on that same Grok Bot.
+
+1. Create a routine with trigger `{ "type": "webhook" }` (UpdateState / ask the bot to create one)
+2. Copy **Webhook URL** + **sender key** from the routine panel — never paste the sender key in chat; use **secret-request** or write to `.env`
+3. Set `GROK_WEBHOOK_URL` and `GROK_WEBHOOK_SECRET` in `.env`
+4. Bridge auth headers (when secret is set): `Authorization: Bearer …` and `X-Automation-Key`
+5. Sidebar deep-links (folder = kebab-case routine name):  
+   `[Webhook URL](grokbot://app/v1/sidebar?target=webhook-url&automation=<folder>)`  
+   `[Sender key](grokbot://app/v1/sidebar?target=sender-key&automation=<folder>)`
+6. Routine prompt should stay **quiet on health/probe** wakes with nothing to do
+
+See [`SETUP-FOR-NEXT-BOT.md`](./SETUP-FOR-NEXT-BOT.md) for the full webhook recipe.
 
 ## Keep it running (no open terminal)
 
