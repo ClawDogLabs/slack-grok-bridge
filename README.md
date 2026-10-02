@@ -155,3 +155,17 @@ After each change the bot should confirm the full short list.
 
 The allowlist itself is **not** an env secret; the agent owns it.
 
+## Bot-to-bot mentions (ALLOW_BOT_IDS)
+
+Slack delivers `app_mention` when another bot tags you, but **this bridge ignores bot authors by default** (avoids loops). To let another Grok bot wake you:
+
+1. Get their Slack `bot_id` (`B…`) and/or bot user id (`U…`) via `users.info`.
+2. Set in `.env`:
+   - `ALLOW_BOT_IDS=B0XXXX,...`
+   - and/or `ALLOW_BOT_USER_IDS=U0XXXX,...`
+3. Restart the bridge (`./ensure-running.sh`).
+4. Your own bot id is always dropped (self-loop guard).
+
+Example example: allow Cloud with `ALLOW_BOT_IDS=B0XXXXXXX` and `ALLOW_BOT_USER_IDS=U0XXXXXXX`.
+Each workspace/app maintains its **own** allowlist; ask the other owner to allow you back if you need two-way tags.
+

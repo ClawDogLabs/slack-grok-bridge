@@ -5,7 +5,8 @@
  * Required env: SLACK_BOT_TOKEN, SLACK_APP_TOKEN, GROK_WEBHOOK_URL
  * Optional: SLACK_SIGNING_SECRET, GROK_WEBHOOK_SECRET, BRIDGE_SOURCE,
  *           THINKING_TIMEOUT_MS (default 45000), HOLD_ACK (default "true"),
- *           HOLD_ACK_BROADCAST (default "true"), OWNER_DISPLAY_NAME (default "the owner")
+ *           HOLD_ACK_BROADCAST (default "true"), OWNER_DISPLAY_NAME (default "the owner"),
+ *           ALLOW_BOT_IDS / ALLOW_BOT_USER_IDS (comma-separated; empty = ignore bot mentions)
  *
  * Ack model: Bolt acks a Socket Mode event when this listener's Promise settles.
  * Never await the Grok webhook (or other slow work) before returning - fire it
@@ -30,6 +31,29 @@ const HOLD_ACK = String(process.env.HOLD_ACK || "true").toLowerCase() !== "false
 const OWNER_DISPLAY_NAME = process.env.OWNER_DISPLAY_NAME || "the owner";
 const HOLD_ACK_BROADCAST = String(process.env.HOLD_ACK_BROADCAST || "true").toLowerCase() !== "false";
 const THINKING_TIMEOUT_MS = Number(process.env.THINKING_TIMEOUT_MS || 45000);
+
+/** Comma-separated Slack bot_ids (B…) and/or bot user ids (U…) allowed to @mention us. Empty = ignore all bots (Slack default). Always ignore our own bot_id. */
+function parseIdList(envVal) {
+  return new Set(
+    String(envVal || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+}
+const ALLOW_BOT_IDS = parseIdList(process.env.ALLOW_BOT_IDS);
+const ALLOW_BOT_USER_IDS = parseIdList(process.env.ALLOW_BOT_USER_IDS);
+let ownBotId = null;
+let ownUserId = null;
+
+function isAllowedBotMention(event) {
+  if (!event.bot_id && event.subtype !== "bot_message") return true; // human
+  if (ownBotId && event.bot_id === ownBotId) return false;
+  if (ownUserId && event.user === ownUserId) return false;
+  if (event.bot_id && ALLOW_BOT_IDS.has(event.bot_id)) return true;
+  if (event.user && ALLOW_BOT_USER_IDS.has(event.user)) return true;
+  return false;
+}
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -222,7 +246,10 @@ async function processInbound({ kind, event, client, logger, sayOnFail }) {
 }
 
 app.event("app_mention", async ({ event, say, client, logger }) => {
-  if (event.bot_id || event.subtype === "bot_message") return;
+  if (!isAllowedBotMention(event)) {
+    logger.info("app_mention ignored (bot not allowlisted)", event.bot_id, event.user);
+    return;
+  }
 
   logger.info("app_mention", event.channel, event.user);
   const threadTs = threadTsFor(event);
@@ -258,7 +285,14 @@ app.message(async ({ message, client, logger }) => {
 
 (async () => {
   await app.start();
+  try {
+    const auth = await app.client.auth.test();
+    ownBotId = auth.bot_id || null;
+    ownUserId = auth.user_id || null;
+  } catch (err) {
+    console.warn("auth.test failed; self-loop guard may be incomplete", err?.data?.error || err?.message || err);
+  }
   console.log(
-    `⚡️ ${BRIDGE_SOURCE} running (Socket Mode; ack-first + thinking + hold-ack)`
+    `⚡️ ${BRIDGE_SOURCE} running (Socket Mode; ack-first + thinking + hold-ack; allow bots: ${[...ALLOW_BOT_IDS, ...ALLOW_BOT_USER_IDS].join(",") || "none"})`
   );
 })();

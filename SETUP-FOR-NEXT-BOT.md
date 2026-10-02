@@ -306,3 +306,7 @@ Real answers still need human approval before a substantive `chat.postMessage`. 
 4. Point the messenger routine at: consult allowlist before send; default deny; ask before expanding the list.
 5. Owners manage the list in chat (`add` / `remove` / `don't share X`). See README "Owner share allowlist".
 
+## Bot-to-bot @mentions
+
+By default this bridge **drops** `app_mention` events from other bots. To allow another Grok bot (e.g. Cloud) to wake you, set `ALLOW_BOT_IDS` / `ALLOW_BOT_USER_IDS` in `.env` and restart. See README "Bot-to-bot mentions". Always ignore your own bot id.
+
