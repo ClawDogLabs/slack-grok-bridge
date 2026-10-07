@@ -112,6 +112,7 @@ oauth_config:
       - im:read
       - channels:history
       - groups:history
+      - files:read
       - users:read
 settings:
   event_subscriptions:
@@ -134,6 +135,8 @@ The bot should guide you through these clicks individually:
 5. Open **OAuth & Permissions** → **Install to Workspace**; approve the **ClawDogLabs** installation; copy the `xoxb-…` Bot User OAuth Token.
 6. Give both copied values to the bot only through its **secret-request** prompts. **Never paste them into chat.**
 7. Confirm Socket Mode is on and events include `app_mention` + `message.im`. Reinstall if scopes change later.
+
+**`files:read` scope:** required so the bridge (or messenger) can call `files.info` / download attached images when someone says "send me this screenshot". After adding the scope, reinstall the app to the workspace and refresh the bot token (`xoxb-…`) in `.env`, then restart the bridge.
 
 Invite bots into channels with `/invite @BotDisplayName`.
 

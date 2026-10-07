@@ -46,9 +46,10 @@ npm install
 1. Socket Mode enabled
 2. App-Level Token with `connections:write` → `SLACK_APP_TOKEN` (`xapp-...`)
 3. Bot User OAuth Token → `SLACK_BOT_TOKEN` (`xoxb-...`)
-4. Bot token scopes (typical): `app_mentions:read`, `chat:write`, `im:history`, `im:read`, `channels:history` (as needed), `users:read`
+4. Bot token scopes (typical): `app_mentions:read`, `chat:write`, `im:history`, `im:read`, `channels:history` (as needed), `users:read`, `files:read`
 5. Subscribe to bot events: `app_mention`, `message.im` (add channel events only if you want them)
 6. Reinstall app to the **ClawDogLabs** workspace after scope changes
+   - `files:read` is required so the bridge (or messenger) can call `files.info` / download attached images when someone says "send me this screenshot". After adding the scope, reinstall the app to the workspace and refresh the bot token (`xoxb-…`) in `.env`, then restart the bridge.
 7. Point `GROK_WEBHOOK_URL` at **this** agent's inbound webhook (not anyone else's)
 8. `bot_user.display_name` must be **ASCII** and match To:/@picker (no accents)
 9. Manifest fields (`name` / `description` / `long_description` / `background_color`) are **user-dependent** — confirm display name with the human first; `background_color` does **not** need to match anyone else's
