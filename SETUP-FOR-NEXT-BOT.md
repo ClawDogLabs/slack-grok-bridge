@@ -1,11 +1,11 @@
-# SETUP-FOR-NEXT-BOT — ClawDogLabs Slack ↔ Grok Bot bridge
+# SETUP-FOR-NEXT-BOT - Slack ↔ Grok Bot bridge
 
 **Primary instruction:** point your Grok Bot at **this repo** and have it clone + follow this doc. Do **not** paste a long one-shot prompt.
 
 ## One-liner (paste this to your Grok Bot)
 
 ```text
-Follow https://github.com/ClawDogLabs/slack-grok-bridge SETUP-FOR-NEXT-BOT.md and set up my Slack bridge for ClawDogLabs.
+Follow https://github.com/ClawDogLabs/slack-grok-bridge SETUP-FOR-NEXT-BOT.md and set up my Slack bridge.
 ```
 
 That is enough. Your Grok Bot will walk you through the human-only Slack clicks **one click at a time**; it will not dump the whole checklist on you at once. The bot does the box work: clone this repo, create the webhook-triggered routine, write `.env` using **secret-request**, install/start the bridge, verify it, and set up the keep-alive routine.
@@ -16,15 +16,15 @@ That is enough. Your Grok Bot will walk you through the human-only Slack clicks 
 
 ### Human clicks (only the Slack website steps)
 
-When your Grok Bot tells you to begin, open [https://api.slack.com/apps](https://api.slack.com/apps) **signed into the ClawDogLabs workspace**. Then follow these clicks, waiting for your bot to guide each step:
+When your Grok Bot tells you to begin, open [https://api.slack.com/apps](https://api.slack.com/apps) **signed into your Slack workspace**. Then follow these clicks, waiting for your bot to guide each step:
 
 1. Click **Create New App**.
 2. Choose **From a manifest** (not Starter and not AI Agent).
-3. Select **ClawDogLabs** if Slack asks for the workspace.
+3. Select your workspace if Slack asks for it.
 4. Paste the manifest YAML from the **Slack app + manifest** section below, replacing only the requested bot-name placeholders.
 5. Click **Next**, review it, then click **Create**.
 6. Open **App-Level Tokens**, click **Generate Token and Scopes**, add the `connections:write` scope, and generate the token (`xapp-…`).
-7. Open **OAuth & Permissions**, click **Install to Workspace** (or **Reinstall to Workspace**) and approve **ClawDogLabs**.
+7. Open **OAuth & Permissions**, click **Install to Workspace** (or **Reinstall to Workspace**) and approve your workspace.
 8. Copy the resulting Bot User OAuth Token (`xoxb-…`) and App-Level Token (`xapp-…`) into the bot's **secret-request** prompts when it asks. **Never paste either token into chat.**
 
 The manifest YAML stays in this SETUP document; no separate manifest file is required.
@@ -43,7 +43,7 @@ The bot should explain and guide each human click as it becomes relevant. It sho
 
 ---
 
-**Workspace:** ClawDogLabs  
+**Workspace:** your own  
 **Template repo:** [ClawDogLabs/slack-grok-bridge](https://github.com/ClawDogLabs/slack-grok-bridge)  
 **Clone path on your box:** `/workspace/slack-<yourbot>-bridge`  
 **Do not** clone into or reuse another person's working tree.  
@@ -57,7 +57,7 @@ No secrets belong in this doc or in chat.
 
 1. Your bot clones this repo → `/workspace/slack-<yourbot>-bridge`.
 2. Confirm an ASCII bot display name with you; the bot fills the manifest placeholders.
-3. Your bot guides the **Human clicks** above, one step at a time: create **From a manifest**, create the app, generate the App-Level Token with `connections:write`, install to ClawDogLabs, and hand the `xoxb`/`xapp` values to **secret-request**.
+3. Your bot guides the **Human clicks** above, one step at a time: create **From a manifest**, create the app, generate the App-Level Token with `connections:write`, install to your workspace, and hand the `xoxb`/`xapp` values to **secret-request**.
 4. Your bot creates **this** bot's Grok inbound webhook routine and sets `GROK_WEBHOOK_URL` + `GROK_WEBHOOK_SECRET`.
 5. Your bot collects `xoxb` then `xapp` via **secret-request** into `.env` (mode 600); values never go into chat.
 6. Your bot runs `npm install` and `./start.sh`, then verifies Socket Mode in `bridge.log`.
@@ -96,7 +96,7 @@ Optional: set webhook payload `source` in `index.js` to identify your bridge (de
 ```yaml
 display_information:
   name: YOUR_BOT_NAME
-  description: Grok Bot bridge for ClawDogLabs
+  description: Grok Bot bridge
   long_description: Socket Mode Slack bridge that wakes this person's Grok Bot on @mentions and DMs, then posts replies back into threads.
   background_color: "#1a1a2e"
 features:
@@ -128,11 +128,11 @@ settings:
 
 The bot should guide you through these clicks individually:
 
-1. Open [https://api.slack.com/apps](https://api.slack.com/apps) while signed into **ClawDogLabs**.
+1. Open [https://api.slack.com/apps](https://api.slack.com/apps) while signed into your workspace.
 2. Click **Create New App** → **From a manifest**.
-3. Choose **ClawDogLabs**, select YAML, paste the manifest above, replace `YOUR_BOT_NAME`, and click **Next** → **Create**.
+3. Choose your workspace, select YAML, paste the manifest above, replace `YOUR_BOT_NAME`, and click **Next** → **Create**.
 4. Open **Basic Information** → **App-Level Tokens** → **Generate Token and Scopes**; add **`connections:write`**; generate and copy the `xapp-…` token.
-5. Open **OAuth & Permissions** → **Install to Workspace**; approve the **ClawDogLabs** installation; copy the `xoxb-…` Bot User OAuth Token.
+5. Open **OAuth & Permissions** → **Install to Workspace**; approve the installation to your workspace; copy the `xoxb-…` Bot User OAuth Token.
 6. Give both copied values to the bot only through its **secret-request** prompts. **Never paste them into chat.**
 7. Confirm Socket Mode is on and events include `app_mention` + `message.im`. Reinstall if scopes change later.
 
@@ -278,7 +278,7 @@ await client.chat.postMessage({
 |------|-----------|
 | Point bot at this repo / paste one-liner | Bot clones and follows docs one step at a time |
 | Clone to `/workspace/slack-<yourbot>-bridge` | Clean tree; no one else's `.env` |
-| Slack app from manifest on ClawDogLabs | Installed; ASCII `bot_user.display_name` matches @picker |
+| Slack app from manifest on your workspace | Installed; ASCII `bot_user.display_name` matches @picker |
 | App-Level Token | `connections:write` scope; `xapp` delivered via secret-request |
 | Bot User OAuth Token | `xoxb` delivered via secret-request |
 | Own webhook routine + `GROK_WEBHOOK_*` | URL + sender key in `.env`; Bearer + X-Automation-Key |
@@ -311,5 +311,5 @@ Real answers still need human approval before a substantive `chat.postMessage`. 
 
 ## Bot-to-bot @mentions
 
-By default this bridge **drops** `app_mention` events from other bots. To allow another Grok bot (e.g. Cloud) to wake you, set `ALLOW_BOT_IDS` / `ALLOW_BOT_USER_IDS` in `.env` and restart. See README "Bot-to-bot mentions". Always ignore your own bot id.
+By default this bridge **drops** `app_mention` events from other bots. To allow another Grok bot to wake you, set `ALLOW_BOT_IDS` / `ALLOW_BOT_USER_IDS` in `.env` and restart. See README "Bot-to-bot mentions". Always ignore your own bot id.
 

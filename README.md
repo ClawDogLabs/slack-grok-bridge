@@ -2,7 +2,7 @@
 
 Always-on Socket Mode bridge template: Slack events → POST to a Grok inbound webhook → your bot replies via Slack Web API.
 
-**Target Slack workspace:** [ClawDogLabs](https://clawdoglabs.slack.com) (or your workspace of choice — tokens and webhook are always per-bot).
+**Target Slack workspace:** your own (tokens and webhook are always per-bot).
 
 ## Handoff for other Grok Bots
 
@@ -11,7 +11,7 @@ Always-on Socket Mode bridge template: Slack events → POST to a Grok inbound w
 One-liner:
 
 ```text
-Follow https://github.com/ClawDogLabs/slack-grok-bridge SETUP-FOR-NEXT-BOT.md and set up my Slack bridge for ClawDogLabs.
+Follow https://github.com/ClawDogLabs/slack-grok-bridge SETUP-FOR-NEXT-BOT.md and set up my Slack bridge.
 ```
 
 Full steps (clone path, Slack manifest YAML, **Grok inbound webhook** setup, secret-request, keep-alive, `reply_broadcast`): [`SETUP-FOR-NEXT-BOT.md`](./SETUP-FOR-NEXT-BOT.md).
@@ -27,7 +27,7 @@ git clone git@github.com:ClawDogLabs/slack-grok-bridge.git slack-<theirbot>-brid
 cd /workspace/slack-<theirbot>-bridge
 ```
 
-Example: bot display name `Gna` → `/workspace/slack-gna-bridge`. Never reuse another person's `.env`, tokens, or `GROK_WEBHOOK_URL`.
+Example: bot display name `YourBot` → `/workspace/slack-yourbot-bridge`. Never reuse another person's `.env`, tokens, or `GROK_WEBHOOK_URL`.
 
 ## On Grok computer
 
@@ -48,7 +48,7 @@ npm install
 3. Bot User OAuth Token → `SLACK_BOT_TOKEN` (`xoxb-...`)
 4. Bot token scopes (typical): `app_mentions:read`, `chat:write`, `im:history`, `im:read`, `channels:history` (as needed), `users:read`, `files:read`
 5. Subscribe to bot events: `app_mention`, `message.im` (add channel events only if you want them)
-6. Reinstall app to the **ClawDogLabs** workspace after scope changes
+6. Reinstall app to your workspace after scope changes
    - `files:read` is required so the bridge (or messenger) can call `files.info` / download attached images when someone says "send me this screenshot". After adding the scope, reinstall the app to the workspace and refresh the bot token (`xoxb-…`) in `.env`, then restart the bridge.
 7. Point `GROK_WEBHOOK_URL` at **this** agent's inbound webhook (not anyone else's)
 8. `bot_user.display_name` must be **ASCII** and match To:/@picker (no accents)
@@ -98,7 +98,7 @@ Bolt acks Socket Mode events when the listener Promise settles. This process:
 5. Posts an instant threaded **hold-ack** so the room knows the bot heard them while the owner reviews
 
 Hold-ack text:
-- Generic: "Got it — checking with the owner and will get back to you."
+- Generic: "Got it - checking with the owner and will get back to you."
 - Personal/family heuristic (kids, schedule, school, address, etc.): "That's not on my approved list of things to share publicly. Let me check with the owner and get back to you."
 
 Env knobs: `HOLD_ACK` (default true), `HOLD_ACK_BROADCAST` (default true; Also send to channel), `THINKING_TIMEOUT_MS` (default 45000 safety clear), `BRIDGE_SOURCE` (payload `source` field).
@@ -167,6 +167,6 @@ Slack delivers `app_mention` when another bot tags you, but **this bridge ignore
 3. Restart the bridge (`./ensure-running.sh`).
 4. Your own bot id is always dropped (self-loop guard).
 
-Example example: allow Cloud with `ALLOW_BOT_IDS=B0XXXXXXX` and `ALLOW_BOT_USER_IDS=U0XXXXXXX`.
+Example: allow another bot with `ALLOW_BOT_IDS=B0XXXXXXX` and `ALLOW_BOT_USER_IDS=U0XXXXXXX` (get the real ids for that bot via `users.info`).
 Each workspace/app maintains its **own** allowlist; ask the other owner to allow you back if you need two-way tags.
 

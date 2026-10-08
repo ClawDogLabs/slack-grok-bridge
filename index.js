@@ -66,14 +66,34 @@ const userCache = new Map();
 const thinkingTimers = new Map();
 
 const LOADING_MESSAGES = [
-  "checking with the owner…",
+  `checking with ${OWNER_DISPLAY_NAME}…`,
   "asking Grok…",
   "almost there…",
 ];
 
-// Heuristic only: stronger hold when the ask looks personal / family / schedule.
-const PERSONAL_RE =
-  /\b(REDACTED|REDACTED|REDACTED|\bmax\b|REDACTED|kids?|child|daughter|son|family|school|calendar|schedule|class(?:es)?|piano|sewing|gymnastics|art class|pickup|carpool|address|home|phone|email|where (?:is|are)|what time|taking)\b/i;
+/**
+ * Heuristic only: stronger hold when the ask looks personal / family / schedule.
+ * PERSONAL_NAMES lets each owner add their own family/private names via .env
+ * (comma-separated) instead of committing them into this shared template.
+ */
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+const PERSONAL_NAMES = String(process.env.PERSONAL_NAMES || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map(escapeRegex);
+const PERSONAL_BASE_TERMS = [
+  "kids?", "child", "daughter", "son", "family", "school", "calendar",
+  "schedule", "class(?:es)?", "piano", "sewing", "gymnastics", "art class",
+  "pickup", "carpool", "address", "home", "phone", "email",
+  "where (?:is|are)", "what time", "taking",
+];
+const PERSONAL_RE = new RegExp(
+  `\\b(${[...PERSONAL_NAMES, ...PERSONAL_BASE_TERMS].join("|")})\\b`,
+  "i"
+);
 
 const HOLD_ACK_GENERIC =
   `Got it - checking with ${OWNER_DISPLAY_NAME} and will get back to you.`;
