@@ -1,0 +1,17 @@
+{
+  "name": "slack-grok-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker: Slack Events API (HTTP) -> Grok inbound webhook, for hosts that sleep",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test test/",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.114.17"
+  }
+}

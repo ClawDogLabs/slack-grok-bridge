@@ -230,7 +230,9 @@ npm install
 tail -n 30 bridge.log
 ```
 
-`./start.sh` refuses to start if required env keys are empty. Do **not** leave `npm start` in a foreground desktop terminal. Use `start.sh` (nohup + `bridge.pid` + `bridge.log`).
+`./start.sh` refuses to start if required env keys are empty. Do **not** leave `npm start` in a foreground desktop terminal. Use `start.sh`: it runs node under `supervise.sh` (nohup + `bridge.pid` = supervisor, `bridge.child.pid` = node, `bridge.log`). The built-in connection watchdog exits node when the socket stays unhealthy for 2 minutes, and the supervisor restarts it.
+
+**If this computer sleeps or freezes when idle** (Grok Bot computers do), Socket Mode will miss messages no matter how the keep-alive is tuned. Set up [`cloudflare-relay/`](./cloudflare-relay/README.md) instead, or as well, and switch the Slack app to HTTP delivery. See README → Lessons learned.
 
 ---
 
@@ -242,7 +244,7 @@ This box has no systemd. Your Grok Bot creates a **scheduled** routine (cron) th
 cd /workspace/slack-<yourbot>-bridge && ./ensure-running.sh
 ```
 
-Use e.g. **`:21` / `:51`** past the hour (twice-hourly weekday daytime). `ensure-running.sh` is quiet/idempotent if already up; it `npm install`s if `node_modules` is missing, then starts.
+Use e.g. **`:21` / `:51`** past the hour (twice-hourly weekday daytime). `ensure-running.sh` is quiet/idempotent if already up; it `npm install`s if `node_modules` is missing, then starts the supervisor if it is down. Not needed (and should be turned off) once the Slack app uses the relay with Socket Mode off.
 
 ---
 
