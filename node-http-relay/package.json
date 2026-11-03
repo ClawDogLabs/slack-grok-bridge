@@ -1,0 +1,15 @@
+{
+  "name": "slack-grok-node-http-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Slack Events API -> Grok Bot webhook relay as a plain Node HTTP server (no Cloudflare needed)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
