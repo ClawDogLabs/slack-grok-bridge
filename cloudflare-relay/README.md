@@ -17,7 +17,7 @@ Slack ──HTTPS (signed)──▶ Worker (always on) ──POST + key──▶
 
 ## What it does
 
-Same routing, payload and headers as the bridge, so **an existing wake routine needs no change**.
+Same routing and headers as the bridge. The JSON body adds `reply_broadcast` (below). A routine that ignores unknown fields keeps working; pass `reply_broadcast` through on the thread reply to honor the default.
 
 - Verifies `X-Slack-Signature` (v0 HMAC-SHA256, 5-minute timestamp window). Unsigned or bad → `401`.
   No signing secret configured → `503` (fails closed).
@@ -25,9 +25,14 @@ Same routing, payload and headers as the bridge, so **an existing wake routine n
 - Acks every event within milliseconds; all slow work (user lookup, webhook, Slack posts) runs in
   `ctx.waitUntil`, so Slack's 3-second deadline is never at risk.
 - `app_mention` (human, or a bot in `ALLOW_BOT_IDS` / `ALLOW_BOT_USER_IDS`) → thinking status →
-  webhook `kind: "app_mention"` → hold-ack in thread. On webhook failure it posts
-  "Could not reach Grok webhook…" in the thread.
-- `message` in a DM (`im`) or group DM (`mpim`) → webhook `kind: "message"` + hold-ack.
+  webhook `kind: "app_mention"` → emoji reaction on the triggering message (`reactions.add` on
+  that message's own `ts`, name from `ACK_EMOJI`, default `white_check_mark`). `invalid_name` retries
+  once with `white_check_mark`. `already_reacted` counts as success. `missing_scope` is logged
+  with a reminder to add `reactions:write` and reinstall. Hold text is not posted. On webhook failure it posts
+  "Could not reach Grok webhook…" in the thread. In a channel thread that notice uses
+  `reply_broadcast` (default true; set `REPLY_BROADCAST=false` to turn it off).
+- `message` in a DM (`im`) or group DM (`mpim`) → webhook `kind: "message"` + the same emoji
+  reaction. `reply_broadcast` is false for DMs and group DMs.
   An explicit @mention in a group DM is handled once, via `app_mention`.
 - Bots (including itself), edits, deletes and other subtypes are ignored, except `file_share`
   (a user posting an image or PDF), which is forwarded with a `files` array.
@@ -37,17 +42,26 @@ Same routing, payload and headers as the bridge, so **an existing wake routine n
 Webhook request (identical to the bridge):
 `POST GROK_WEBHOOK_URL` with `Authorization: Bearer <GROK_WEBHOOK_SECRET>` and
 `X-Automation-Key: <GROK_WEBHOOK_SECRET>`, body
-`{ source, kind, slack: { type, user, user_name, user_real_name, user_display_name, channel, channel_type, ts, thread_ts, text, subtype, files }, hold_ack }`.
+`{ source, kind, slack: { type, user, user_name, user_real_name, user_display_name, channel, channel_type, ts, thread_ts, text, subtype, files }, hold_ack, reply_broadcast }`.
+
+`hold_ack` is `personal` or `generic` (a privacy hint for the routine). The Worker does not post that text. `reply_broadcast` is true for channel-thread wakes unless `REPLY_BROADCAST=false`. Pass it through on `chat.postMessage` when you reply in the thread. It is false for DMs and group DMs.
+
+### Ack and channel replies
+
+| Var | Effect |
+|-----|--------|
+| `ACK_EMOJI` | Reaction added to the triggering message (default `white_check_mark`). Set a custom workspace emoji name, without colons. `invalid_name` falls back to `white_check_mark`. |
+| `HOLD_ACK` | `"false"` turns the emoji ack off. Default on. Hold text is not posted either way. |
+| `HOLD_ACK_SKIP_REGEX` | Asks matching this regex get no ack reaction (e.g. off-topic questions your routine will politely decline). |
+| `REPLY_BROADCAST` | `"false"` turns off “Also send to channel” for channel-thread replies. Default `"true"`. The wake payload carries the value. |
 
 ### Optional extras (off by default)
 
 | Var | Effect |
 |-----|--------|
-| `WATCH_CHANNEL_IDS` | Forward messages in these channels **without** an @mention, as `{ kind: "channel_message", watched: true, slack }` (no thinking / hold-ack). A cheap pre-filter skips short chatter: forwarded only if it has `BOT_NAME`, a `?`, or more than 4 words. Your routine must decide whether to answer. |
-| `WELCOME_CHANNEL_IDS`, `WELCOME_TEXT`, `ASK_CHANNEL_ID` | New human joiners get a :wave: reaction and `WELCOME_TEXT` (`{user}`, `{ask_channel}` placeholders). Needs `reactions:write`. |
+| `WATCH_CHANNEL_IDS` | Forward messages in these channels **without** an @mention, as `{ kind: "channel_message", watched: true, slack, reply_broadcast }` (no thinking / emoji ack). A cheap pre-filter skips short chatter: forwarded only if it has `BOT_NAME`, a `?`, or more than 4 words. Your routine must decide whether to answer. |
+| `WELCOME_CHANNEL_IDS`, `WELCOME_TEXT`, `ASK_CHANNEL_ID` | New human joiners get a :wave: reaction and `WELCOME_TEXT` (`{user}`, `{ask_channel}` placeholders). Needs `reactions:write` (the same scope as the emoji ack). |
 | `BOT_NAME`, `MPIM_REQUIRE_ADDRESS` | With `MPIM_REQUIRE_ADDRESS="true"`, group DMs only wake the bot when it's @mentioned or `BOT_NAME` appears. |
-| `HOLD_ACK_DM_TOP_LEVEL` | `"true"` posts the DM hold-ack as a normal message instead of a thread reply. |
-| `HOLD_ACK_SKIP_REGEX` | Asks matching this regex get no hold-ack (e.g. off-topic questions your routine will politely decline). |
 | `RETRY_POLICY` | See below. |
 
 ### Slack retries and Delayed Events
@@ -105,19 +119,23 @@ works on Node 18/20. Wrangler v4 needs Node 20+ (or newer, check its release not
 
 In [api.slack.com/apps](https://api.slack.com/apps) → your app:
 
-1. **Event Subscriptions → Subscribe to bot events:** write down the current list and keep it the
+1. **OAuth & Permissions:** the bot token needs `reactions:write` (in the manifest in
+   [`SETUP-FOR-NEXT-BOT.md`](../SETUP-FOR-NEXT-BOT.md)). Add it and reinstall if this app was
+   created without that scope, then refresh `SLACK_BOT_TOKEN`. A `missing_scope` line in the logs
+   means the ack reaction cannot be added.
+2. **Event Subscriptions → Subscribe to bot events:** write down the current list and keep it the
    same (typically `app_mention`, `message.im`, `message.mpim`, plus `message.channels` /
    `message.groups` if you use `WATCH_CHANNEL_IDS` / `WELCOME_CHANNEL_IDS`).
-2. **Socket Mode →** turn **Enable Socket Mode** off. While Socket Mode is on, Slack keeps delivering
+3. **Socket Mode →** turn **Enable Socket Mode** off. While Socket Mode is on, Slack keeps delivering
    over the socket and never calls the Request URL.
-3. **Event Subscriptions →** Enable Events on → **Request URL**
+4. **Event Subscriptions →** Enable Events on → **Request URL**
    `https://<worker-url>/slack/events` → wait for **Verified** → turn on **Delayed Events** →
    **Save Changes**. Reinstall the app only if Slack shows a banner asking you to.
-4. Stop the Socket Mode bridge (`../stop.sh`) and change any keep-alive routine so it no longer
+5. Stop the Socket Mode bridge (`../stop.sh`) and change any keep-alive routine so it no longer
    runs `ensure-running.sh`. With Socket Mode off, the bridge would crash-loop on
    `apps.connections.open`.
-5. Test: DM the bot, and @mention it in a channel it's in, while watching
-   `npx wrangler tail slack-grok-relay`.
+6. Test: DM the bot, and @mention it in a channel it's in, while watching
+   `npx wrangler tail slack-grok-relay`. The triggering message should get the ack reaction.
 
 ## Redeploy / rollback
 

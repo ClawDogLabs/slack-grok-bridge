@@ -82,7 +82,7 @@ container (Fly, Railway, Render, Cloud Run with CPU always allocated, a VPS) avo
 If you connect Slack to your Grok Bot account, a routine can be triggered by Slack directly (for
 example on a mention or a phrase). That needs **no custom bridge at all**, and is a good fit for
 narrow "wake when X is said" cases. It is **not** a full replacement for Socket Mode / the Events
-API relay: no custom routing rules, hold-ack messages, thinking status, bot-to-bot allowlists,
+API relay: no custom routing rules, emoji ack reactions, thinking status, bot-to-bot allowlists,
 watched channels, welcome messages, or your own Slack app identity.
 
 ### (e) Tunnels (ngrok, cloudflared, ...)

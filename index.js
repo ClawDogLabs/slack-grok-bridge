@@ -5,7 +5,9 @@
  * Required env: SLACK_BOT_TOKEN, SLACK_APP_TOKEN, GROK_WEBHOOK_URL
  * Optional: SLACK_SIGNING_SECRET, GROK_WEBHOOK_SECRET, BRIDGE_SOURCE,
  *           THINKING_TIMEOUT_MS (default 45000), HOLD_ACK (default "true"),
- *           HOLD_ACK_BROADCAST (default "true"), OWNER_DISPLAY_NAME (default "the owner"),
+ *           ACK_EMOJI (default "white_check_mark"; custom workspace emoji name allowed),
+ *           REPLY_BROADCAST (default "true"; channel-thread replies also post to the channel),
+ *           OWNER_DISPLAY_NAME (default "the owner"),
  *           ALLOW_BOT_IDS / ALLOW_BOT_USER_IDS (comma-separated; empty = ignore bot mentions),
  *           CLIENT_PING_TIMEOUT_MS (default 15000), SERVER_PING_TIMEOUT_MS (default 60000),
  *           WATCHDOG_MAX_UNHEALTHY_MS (default 120000)
@@ -19,9 +21,10 @@
  * Never await the Grok webhook (or other slow work) before returning - fire it
  * after a fast thinking status so Slack does not retry (3s) and duplicate wakes.
  *
- * After a successful webhook wake, post an instant threaded hold-ack so the room
- * knows the bot heard them while the human owner reviews. Personal/family asks
- * get a stronger privacy hold message.
+ * After a successful webhook wake, react to the triggering message (its own ts)
+ * so the room knows the bot heard them while the human owner reviews.
+ * Hold text is not posted. Personal/family asks are still flagged on the wake
+ * payload (hold_ack: "personal") for the routine's privacy check.
  */
 const { App, SocketModeReceiver } = require("@slack/bolt");
 
@@ -36,8 +39,23 @@ for (const key of required) {
 const BRIDGE_SOURCE = process.env.BRIDGE_SOURCE || "slack-grok-bridge";
 const HOLD_ACK = String(process.env.HOLD_ACK || "true").toLowerCase() !== "false";
 const OWNER_DISPLAY_NAME = process.env.OWNER_DISPLAY_NAME || "the owner";
-const HOLD_ACK_BROADCAST = String(process.env.HOLD_ACK_BROADCAST || "true").toLowerCase() !== "false";
+const DEFAULT_ACK_EMOJI = "white_check_mark";
+function normalizeEmojiName(raw) {
+  const name = String(raw ?? "").trim().replace(/^:+|:+$/g, "");
+  return name || DEFAULT_ACK_EMOJI;
+}
+const ACK_EMOJI = normalizeEmojiName(process.env.ACK_EMOJI);
+const REPLY_BROADCAST = String(process.env.REPLY_BROADCAST ?? "true").toLowerCase() !== "false";
 const THINKING_TIMEOUT_MS = Number(process.env.THINKING_TIMEOUT_MS || 45000);
+
+/** Public/private channel threads get reply_broadcast. DMs and group DMs do not. */
+function isChannelThread(event) {
+  const ct = event?.channel_type;
+  if (ct === "im" || ct === "mpim") return false;
+  if (ct === "channel" || ct === "group") return true;
+  const ch = String(event?.channel || "");
+  return !!ch && !ch.startsWith("D");
+}
 
 /** Comma-separated Slack bot_ids (B…) and/or bot user ids (U…) allowed to @mention us. Empty = ignore all bots (Slack default). Always ignore our own bot_id. */
 function parseIdList(envVal) {
@@ -164,11 +182,6 @@ const PERSONAL_RE = new RegExp(
   `\\b(${[...PERSONAL_NAMES, ...PERSONAL_BASE_TERMS].join("|")})\\b`,
   "i"
 );
-
-const HOLD_ACK_GENERIC =
-  `Got it - checking with ${OWNER_DISPLAY_NAME} and will get back to you.`;
-const HOLD_ACK_PERSONAL =
-  `That's not on my approved list of things to share publicly. Let me check with ${OWNER_DISPLAY_NAME} and get back to you.`;
 
 async function resolveUser(client, userId) {
   if (!userId) return null;
@@ -309,25 +322,47 @@ async function clearThinking(client, channel, threadTs, logger) {
   }
 }
 
-async function postHoldAck(client, channel, threadTs, text, logger) {
-  if (!HOLD_ACK || !channel || !threadTs) return;
-  const body = looksPersonal(text) ? HOLD_ACK_PERSONAL : HOLD_ACK_GENERIC;
+const MISSING_SCOPE_LOG =
+  "ack reaction failed: missing_scope. Add reactions:write to the Slack app bot scopes, reinstall the app to the workspace, and refresh the bot token.";
+
+/** Ack by emoji on the triggering message. Does not post hold text. */
+async function addAckReaction(client, channel, messageTs, logger) {
+  if (!HOLD_ACK || !channel || !messageTs) return;
+  const tryAdd = async (name) => {
+    try {
+      const res = await client.reactions.add({ channel, timestamp: messageTs, name });
+      if (res?.ok === false) {
+        const error = res.error || "";
+        if (error === "already_reacted") return { ok: true, error };
+        return { ok: false, error };
+      }
+      return { ok: true };
+    } catch (err) {
+      const code = err?.data?.error || "";
+      if (code === "already_reacted") return { ok: true, error: code };
+      return { ok: false, error: code || err?.message || "unknown" };
+    }
+  };
   try {
-    await client.chat.postMessage({
-      channel,
-      thread_ts: threadTs,
-      text: body,
-      reply_broadcast: HOLD_ACK_BROADCAST,
-    });
+    let name = ACK_EMOJI;
+    let data = await tryAdd(name);
+    if (!data.ok && data.error === "invalid_name" && name !== DEFAULT_ACK_EMOJI) {
+      logger?.warn?.(`ack emoji "${name}" is invalid_name; falling back to ${DEFAULT_ACK_EMOJI}`);
+      name = DEFAULT_ACK_EMOJI;
+      data = await tryAdd(name);
+    }
+    if (data.ok) return;
+    if (data.error === "missing_scope") logger?.warn?.(MISSING_SCOPE_LOG);
+    else logger?.warn?.("ack reaction failed", data.error || "unknown");
   } catch (err) {
-    logger?.warn?.("hold-ack post failed", err?.data?.error || err?.message || err);
+    logger?.warn?.("ack reaction failed", err?.message || err);
   }
 }
 
 /**
  * Slow path: resolve user, wake Grok. Runs AFTER the Bolt listener returns (ack).
- * Clear thinking as soon as the webhook is accepted, then post an instant hold-ack
- * so the room is not left on a forever spinner while the owner reviews.
+ * Clear thinking as soon as the webhook is accepted, then react to the triggering
+ * message so the room is not left on a forever spinner while the owner reviews.
  */
 async function processInbound({ kind, event, client, logger, sayOnFail }) {
   const channel = event.channel;
@@ -339,19 +374,22 @@ async function processInbound({ kind, event, client, logger, sayOnFail }) {
       kind,
       slack,
       hold_ack: looksPersonal(slack.text) ? "personal" : "generic",
+      reply_broadcast: REPLY_BROADCAST && isChannelThread(event),
     });
     logger.info(`[${ts()}] wake ok`, kind, channel, event.ts);
     await clearThinking(client, channel, threadTs, logger);
-    await postHoldAck(client, channel, threadTs, slack.text, logger);
+    await addAckReaction(client, channel, event.ts, logger);
   } catch (err) {
     logger.error(`[${ts()}] wake FAILED`, kind, channel, event.ts, err?.message || err);
     await clearThinking(client, channel, threadTs, logger);
     if (sayOnFail) {
       try {
-        await sayOnFail({
+        const notice = {
           text: "Could not reach Grok webhook. Check GROK_WEBHOOK_URL / secret.",
           thread_ts: threadTs,
-        });
+        };
+        if (isChannelThread(event)) notice.reply_broadcast = REPLY_BROADCAST;
+        await sayOnFail(notice);
       } catch (sayErr) {
         logger.error(sayErr);
       }
@@ -420,6 +458,6 @@ const startTimer = setTimeout(() => {
     console.warn("auth.test failed; self-loop guard may be incomplete", err?.data?.error || err?.message || err);
   }
   console.log(
-    `[${ts()}] ⚡️ ${BRIDGE_SOURCE} running (Socket Mode; ping ${CLIENT_PING_TIMEOUT_MS}/${SERVER_PING_TIMEOUT_MS}ms; watchdog ${WATCHDOG_MAX_UNHEALTHY_MS}ms; ack-first + thinking + hold-ack; allow bots: ${[...ALLOW_BOT_IDS, ...ALLOW_BOT_USER_IDS].join(",") || "none"})`
+    `[${ts()}] ⚡️ ${BRIDGE_SOURCE} running (Socket Mode; ping ${CLIENT_PING_TIMEOUT_MS}/${SERVER_PING_TIMEOUT_MS}ms; watchdog ${WATCHDOG_MAX_UNHEALTHY_MS}ms; ack-first + thinking + emoji-ack; allow bots: ${[...ALLOW_BOT_IDS, ...ALLOW_BOT_USER_IDS].join(",") || "none"})`
   );
 })();

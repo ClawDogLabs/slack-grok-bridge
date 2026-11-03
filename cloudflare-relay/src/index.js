@@ -30,6 +30,33 @@ const isTrue = (v, dflt) => (v === undefined || v === null || v === "" ? dflt : 
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
+/** Default ack reaction. Also the fallback when a custom ACK_EMOJI is invalid_name. */
+export const DEFAULT_ACK_EMOJI = "white_check_mark";
+
+/** Slack reaction names have no colons. Blank means the default. */
+export function normalizeEmojiName(raw) {
+  const name = String(raw ?? "").trim().replace(/^:+|:+$/g, "");
+  return name || DEFAULT_ACK_EMOJI;
+}
+
+/**
+ * A reply in a public or private channel thread (Slack “Also send to channel”).
+ * DMs and group DMs are not channel threads. app_mention often omits channel_type;
+ * a C…/G… id that is not a DM still counts.
+ */
+export function isChannelThread(e) {
+  const ct = e?.channel_type;
+  if (ct === "im" || ct === "mpim") return false;
+  if (ct === "channel" || ct === "group") return true;
+  const ch = String(e?.channel || "");
+  return !!ch && !ch.startsWith("D");
+}
+
+/** Channel-thread replies broadcast unless REPLY_BROADCAST=false. */
+export function replyBroadcastFor(e, c) {
+  return !!(c?.replyBroadcast && isChannelThread(e));
+}
+
 // Own ids: from vars if set, else looked up once per isolate with auth.test.
 let selfCache = null;
 
@@ -44,11 +71,9 @@ export function cfg(env) {
     source: env.BRIDGE_SOURCE || "slack-grok-bridge",
     owner,
     holdAck: isTrue(env.HOLD_ACK, true),
-    holdAckBroadcast: isTrue(env.HOLD_ACK_BROADCAST, true),
-    holdAckDmTopLevel: isTrue(env.HOLD_ACK_DM_TOP_LEVEL, false),
+    ackEmoji: normalizeEmojiName(env.ACK_EMOJI),
+    replyBroadcast: isTrue(env.REPLY_BROADCAST, true),
     holdAckSkip,
-    holdAckGeneric: `Got it - checking with ${owner} and will get back to you.`,
-    holdAckPersonal: `That's not on my approved list of things to share publicly. Let me check with ${owner} and get back to you.`,
     loading: [`checking with ${owner}…`, "asking Grok…", "almost there…"],
     personalRe: new RegExp(`\\b(${[...list(env.PERSONAL_NAMES).map(escapeRegex), ...PERSONAL_BASE_TERMS].join("|")})\\b`, "i"),
     botNameRe: botName ? new RegExp(`\\b${escapeRegex(botName)}\\b`, "i") : null,
@@ -160,7 +185,7 @@ export function dropRetry(reason, c) {
 }
 
 // ---------------------------------------------------------------- Slack Web API
-async function slackApi(env, method, body, { get = false } = {}) {
+async function slackApi(env, method, body, { get = false, quiet = false } = {}) {
   const url = `https://slack.com/api/${method}`;
   const headers = { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` };
   let res;
@@ -171,7 +196,7 @@ async function slackApi(env, method, body, { get = false } = {}) {
     res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
   }
   const data = await res.json().catch(() => ({ ok: false, error: `http_${res.status}` }));
-  if (!data.ok) log(`slack ${method} failed:`, data.error);
+  if (!data.ok && !quiet) log(`slack ${method} failed:`, data.error);
   return data;
 }
 
@@ -239,13 +264,40 @@ const setThinking = (env, c, channel, threadTs) =>
 const clearThinking = (env, channel, threadTs) =>
   slackApi(env, "assistant.threads.setStatus", { channel_id: channel, thread_ts: threadTs, status: "" }).catch(() => {});
 
-async function postHoldAck(env, c, channel, threadTs, text, topLevel) {
-  if (!c.holdAck || !channel || !threadTs) return;
-  if (c.holdAckSkip && c.holdAckSkip.test(String(text || ""))) return log("hold-ack skipped (HOLD_ACK_SKIP_REGEX)");
-  const body = c.personalRe.test(String(text || "")) ? c.holdAckPersonal : c.holdAckGeneric;
-  await slackApi(env, "chat.postMessage", topLevel
-    ? { channel, text: body }
-    : { channel, thread_ts: threadTs, text: body, reply_broadcast: c.holdAckBroadcast }).catch(() => {});
+const MISSING_SCOPE_LOG =
+  "ack reaction failed: missing_scope. Add reactions:write to the Slack app bot scopes, reinstall the app to the workspace, and refresh the bot token.";
+
+/**
+ * Ack by emoji reaction on the triggering message (its own ts). Does not post hold text.
+ * invalid_name → one retry with white_check_mark. already_reacted is success.
+ * missing_scope is logged with the scope name so the installer can fix the app.
+ */
+export async function ackWithReaction(env, c, channel, messageTs, text) {
+  if (!c?.holdAck || !channel || !messageTs) return { ok: true, skipped: true };
+  if (c.holdAckSkip && c.holdAckSkip.test(String(text || ""))) {
+    log("ack skipped (HOLD_ACK_SKIP_REGEX)");
+    return { ok: true, skipped: true };
+  }
+  const preferred = c.ackEmoji || DEFAULT_ACK_EMOJI;
+  try {
+    let name = preferred;
+    let data = await slackApi(env, "reactions.add", { channel, timestamp: messageTs, name }, { quiet: true });
+    if (!(data.ok || data.error === "already_reacted") && data.error === "invalid_name" && name !== DEFAULT_ACK_EMOJI) {
+      log(`ack emoji "${name}" is invalid_name; falling back to ${DEFAULT_ACK_EMOJI}`);
+      name = DEFAULT_ACK_EMOJI;
+      data = await slackApi(env, "reactions.add", { channel, timestamp: messageTs, name }, { quiet: true });
+    }
+    if (data.ok || data.error === "already_reacted") {
+      log(data.error === "already_reacted" ? "ack already_reacted" : "ack", name, channel, messageTs);
+      return { ok: true, name, already: data.error === "already_reacted", fallback: name !== preferred };
+    }
+    if (data.error === "missing_scope") log(MISSING_SCOPE_LOG);
+    else log("ack reaction failed:", data.error || "unknown");
+    return { ok: false, error: data.error, name };
+  } catch (err) {
+    log("ack reaction failed:", err?.message || err);
+    return { ok: false, error: "exception" };
+  }
 }
 
 // ---------------------------------------------------------------- handlers (run in waitUntil)
@@ -255,18 +307,27 @@ async function processInbound(env, c, kind, e, sayOnFail) {
   await setThinking(env, c, channel, threadTs);
   try {
     const slack = await summarizeEvent(env, e);
-    await wakeGrok(env, { source: c.source, kind, slack, hold_ack: c.personalRe.test(String(slack.text || "")) ? "personal" : "generic" });
+    const personal = c.personalRe.test(String(slack.text || ""));
+    await wakeGrok(env, {
+      source: c.source,
+      kind,
+      slack,
+      hold_ack: personal ? "personal" : "generic",
+      reply_broadcast: replyBroadcastFor(e, c),
+    });
     log("wake ok", kind, channel, e.ts);
     await clearThinking(env, channel, threadTs);
-    const isDm = e.channel_type === "im" || e.channel_type === "mpim";
-    await postHoldAck(env, c, channel, threadTs, slack.text, c.holdAckDmTopLevel && isDm && !e.thread_ts);
+    // React to the triggering message itself (e.ts), not the thread parent.
+    await ackWithReaction(env, c, channel, e.ts, slack.text);
   } catch (err) {
     log("wake FAILED", kind, channel, e.ts, err?.message || err);
     await clearThinking(env, channel, threadTs);
     if (sayOnFail) {
-      await slackApi(env, "chat.postMessage", {
+      const msg = {
         channel, thread_ts: threadTs, text: "Could not reach Grok webhook. Check GROK_WEBHOOK_URL / secret.",
-      }).catch(() => {});
+      };
+      if (isChannelThread(e)) msg.reply_broadcast = !!c.replyBroadcast;
+      await slackApi(env, "chat.postMessage", msg).catch(() => {});
     }
   }
 }
@@ -274,7 +335,13 @@ async function processInbound(env, c, kind, e, sayOnFail) {
 async function forwardWatched(env, c, e) {
   try {
     const slack = await summarizeEvent(env, e);
-    await wakeGrok(env, { source: c.source, kind: "channel_message", watched: true, slack });
+    await wakeGrok(env, {
+      source: c.source,
+      kind: "channel_message",
+      watched: true,
+      slack,
+      reply_broadcast: replyBroadcastFor(e, c),
+    });
     log("wake ok", "channel_message", e.channel, e.ts);
   } catch (err) {
     log("wake FAILED", "channel_message", e.channel, e.ts, err?.message || err);

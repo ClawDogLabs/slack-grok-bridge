@@ -59,10 +59,11 @@ npm install
 1. Socket Mode enabled
 2. App-Level Token with `connections:write` → `SLACK_APP_TOKEN` (`xapp-...`)
 3. Bot User OAuth Token → `SLACK_BOT_TOKEN` (`xoxb-...`)
-4. Bot token scopes (typical): `app_mentions:read`, `chat:write`, `im:history`, `im:read`, `channels:history` (as needed), `users:read`, `files:read`
+4. Bot token scopes (typical): `app_mentions:read`, `chat:write`, `reactions:write`, `im:history`, `im:read`, `channels:history` (as needed), `users:read`, `files:read`
 5. Subscribe to bot events: `app_mention`, `message.im` (add channel events only if you want them)
 6. Reinstall app to your workspace after scope changes
    - `files:read` is required so the bridge (or messenger) can call `files.info` / download attached images when someone says "send me this screenshot". After adding the scope, reinstall the app to the workspace and refresh the bot token (`xoxb-…`) in `.env`, then restart the bridge.
+   - `reactions:write` is required for the emoji ack (and the welcome `:wave:`). After adding the scope, reinstall the app and refresh the bot token.
 7. Point `GROK_WEBHOOK_URL` at **this** agent's inbound webhook (not anyone else's)
 8. `bot_user.display_name` must be **ASCII** and match To:/@picker (no accents)
 9. Manifest fields (`name` / `description` / `long_description` / `background_color`) are **user-dependent** — confirm display name with the human first; `background_color` does **not** need to match anyone else's
@@ -111,24 +112,28 @@ Do not leave `npm start` in a foreground desktop terminal; closing that session 
 
 ## Ack + thinking status
 
-Bolt acks Socket Mode events when the listener Promise settles. This process:
+Bolt acks Socket Mode events when the listener Promise settles. The HTTP relays ack the Events API request the same way: fast, then work in the background. This process:
 1. Shows a short `is thinking…` status
 2. Returns so Slack gets the ack within the 3s window
 3. Resolves the user + POSTs the Grok webhook in the background
 4. Clears the spinner as soon as the webhook is accepted
-5. Posts an instant threaded **hold-ack** so the room knows the bot heard them while the owner reviews
+5. Adds an **emoji reaction** on the triggering message (its own `ts`) so the room knows the bot heard them while the owner reviews
 
-Hold-ack text:
-- Generic: "Got it - checking with the owner and will get back to you."
-- Personal/family heuristic (kids, schedule, school, address, etc.): "That's not on my approved list of things to share publicly. Let me check with the owner and get back to you."
+The reaction name is `ACK_EMOJI` (default `white_check_mark`, no colons). A custom workspace emoji is fine. If Slack returns `invalid_name`, the bridge retries once with `white_check_mark`. `already_reacted` counts as success. `missing_scope` is logged with a reminder to add the `reactions:write` bot scope and reinstall the app.
 
-Env knobs: `HOLD_ACK` (default true), `HOLD_ACK_BROADCAST` (default true; Also send to channel), `THINKING_TIMEOUT_MS` (default 45000 safety clear), `BRIDGE_SOURCE` (payload `source` field).
+Hold text is not posted. `HOLD_ACK=false` turns the reaction off. On the relay, `HOLD_ACK_SKIP_REGEX` skips the reaction for matching text.
+
+The wake payload still includes `hold_ack`: `personal` or `generic` (a privacy hint for the routine when the ask looks like family, schedule, school, address, and similar). That field is not a message this bridge posts.
+
+Env knobs: `HOLD_ACK` (default true), `ACK_EMOJI` (default `white_check_mark`), `REPLY_BROADCAST` (default true), `THINKING_TIMEOUT_MS` (default 45000 safety clear), `BRIDGE_SOURCE` (payload `source` field).
 
 A later approved `chat.postMessage` is the real answer. Needs `chat:write`.
 
 ## Outbound replies
 
-Human ack before send unless standing permission. Use `chat.postMessage` with `channel` + `thread_ts`. For channel-visible thread replies (Slack UI “Also send to #channel”), set **`reply_broadcast: true`** on that message — it is a **per-message** API flag, not a YAML/manifest setting.
+Human ack before send unless standing permission. Use `chat.postMessage` with `channel` + `thread_ts`.
+
+Replies in a **channel thread** default to **`reply_broadcast: true`** (Slack UI “Also send to #channel”). It is a **per-message** API flag, not a YAML/manifest setting. DMs and group DMs are not broadcast. The wake payload includes `reply_broadcast` with that choice — pass it through on the thread reply. Set `REPLY_BROADCAST=false` on the bridge or relay to turn it off. The bridge's own channel-thread posts (the webhook-failure notice) follow the same switch.
 
 Invite the bot into channels with `/invite @YourBotDisplayName`.
 
@@ -141,7 +146,7 @@ Invite the bot into channels with `/invite @YourBotDisplayName`.
 
 ## Owner share allowlist (Grok-managed)
 
-Hold-ack is only UX. What the bot may **answer without asking again** is an **owner-specific allowlist** kept by that owner's Grok Bot.
+The emoji ack is only UX. What the bot may **answer without asking again** is an **owner-specific allowlist** kept by that owner's Grok Bot.
 
 ### Principles
 
@@ -173,9 +178,10 @@ After each change the bot should confirm the full short list.
 
 | Env | Role |
 | --- | --- |
-| `OWNER_DISPLAY_NAME` | Name used in hold-ack text (default `the owner`) |
-| `HOLD_ACK` | Instant threaded ack after webhook (default on) |
-| `HOLD_ACK_BROADCAST` | Also send hold-ack to channel (default on) |
+| `OWNER_DISPLAY_NAME` | Name used in the thinking status (default `the owner`) |
+| `HOLD_ACK` | Emoji reaction on the triggering message after a successful wake (default on). Hold text is not posted. |
+| `ACK_EMOJI` | Reaction name (default `white_check_mark`). A custom workspace emoji name is allowed. |
+| `REPLY_BROADCAST` | Channel-thread replies also go to the channel (default on). Set `false` to turn off. |
 
 The allowlist itself is **not** an env secret; the agent owns it.
 
