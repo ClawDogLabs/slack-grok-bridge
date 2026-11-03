@@ -1,0 +1,37 @@
+# Copy to wrangler.toml (git-ignored) and fill in. Never put secrets in this file.
+name = "slack-grok-relay"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+# account_id = "<your-cloudflare-account-id>"   # or export CLOUDFLARE_ACCOUNT_ID
+workers_dev = true                               # https://slack-grok-relay.<your-subdomain>.workers.dev
+
+[observability]
+enabled = true
+
+# Non-secret config. Mirrors the bridge's .env where the names match.
+[vars]
+BRIDGE_SOURCE = "slack-grok-bridge"   # "source" field sent to the Grok webhook
+HOLD_ACK = "true"
+HOLD_ACK_BROADCAST = "true"
+OWNER_DISPLAY_NAME = ""               # used in hold-ack / thinking text ("the owner" if empty)
+PERSONAL_NAMES = ""                   # comma-separated names that trigger the stronger privacy hold-ack
+ALLOW_BOT_IDS = ""                    # other bots allowed to @mention this bot (B...), comma-separated
+ALLOW_BOT_USER_IDS = ""               # same, by bot user id (U...)
+
+# Optional. Leave empty to have the Worker look these up once with auth.test.
+OWN_USER_ID = ""                      # this bot's user id (U...)
+OWN_BOT_ID = ""                       # this bot's bot id (B...)
+
+# Optional extras (off when empty / false):
+HOLD_ACK_DM_TOP_LEVEL = "false"       # "true" = post the hold-ack as a normal DM message, not in a thread
+HOLD_ACK_SKIP_REGEX = ""              # JS regex (case-insensitive); matching asks get no hold-ack
+BOT_NAME = ""                         # e.g. "mybot"; plain-text name that counts as addressing the bot
+MPIM_REQUIRE_ADDRESS = "false"        # "true" = in group DMs only wake when @mentioned or BOT_NAME appears
+WATCH_CHANNEL_IDS = ""                # channels (C...) to forward WITHOUT an @mention, as kind "channel_message"
+WELCOME_CHANNEL_IDS = ""              # channels (C...) where new joiners get a :wave: + WELCOME_TEXT
+ASK_CHANNEL_ID = ""                   # channel referenced as {ask_channel} in WELCOME_TEXT
+WELCOME_TEXT = ""                     # placeholders {user} and {ask_channel}; a generic default is used if empty
+RETRY_POLICY = "drop_timeouts"        # drop_timeouts | drop_all | process_all (see README)
+
+# Secrets (set with `npx wrangler secret put NAME`, never in this file):
+#   SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, GROK_WEBHOOK_URL, GROK_WEBHOOK_SECRET
