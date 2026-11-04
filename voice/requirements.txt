@@ -1,0 +1,5 @@
+# Local voice in/out for the Slack routine.
+# ffmpeg is a system package (not installed by pip) and must be on PATH.
+# faster-whisper uses it to decode Slack audio (m4a, mp3, webm, wav, ogg).
+faster-whisper
+edge-tts

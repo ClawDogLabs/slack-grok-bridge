@@ -59,10 +59,11 @@ npm install
 1. Socket Mode enabled
 2. App-Level Token with `connections:write` → `SLACK_APP_TOKEN` (`xapp-...`)
 3. Bot User OAuth Token → `SLACK_BOT_TOKEN` (`xoxb-...`)
-4. Bot token scopes (typical): `app_mentions:read`, `chat:write`, `im:history`, `im:read`, `channels:history` (as needed), `users:read`, `files:read`
+4. Bot token scopes (typical): `app_mentions:read`, `chat:write`, `im:history`, `im:read`, `channels:history` (as needed), `users:read`, `files:read`, `files:write`, `reactions:write`
 5. Subscribe to bot events: `app_mention`, `message.im` (add channel events only if you want them)
 6. Reinstall app to your workspace after scope changes
-   - `files:read` is required so the bridge (or messenger) can call `files.info` / download attached images when someone says "send me this screenshot". After adding the scope, reinstall the app to the workspace and refresh the bot token (`xoxb-…`) in `.env`, then restart the bridge.
+   - `reactions:write` is required for the acknowledgement emoji (`ACK_REACTION`, default `white_check_mark`). Without it the bridge logs the missing scope and still wakes the routine.
+   - `files:read` lets the bridge or the routine call `files.info` and download attachments. `files:write` is required for [voice replies](voice/README.md). After adding a scope, reinstall the app to the workspace and refresh the bot token in `.env`, then restart the bridge.
 7. Point `GROK_WEBHOOK_URL` at **this** agent's inbound webhook (not anyone else's)
 8. `bot_user.display_name` must be **ASCII** and match To:/@picker (no accents)
 9. Manifest fields (`name` / `description` / `long_description` / `background_color`) are **user-dependent** — confirm display name with the human first; `background_color` does **not** need to match anyone else's
@@ -112,25 +113,47 @@ Do not leave `npm start` in a foreground desktop terminal; closing that session 
 ## Ack + thinking status
 
 Bolt acks Socket Mode events when the listener Promise settles. This process:
-1. Shows a short `is thinking…` status
-2. Returns so Slack gets the ack within the 3s window
-3. Resolves the user + POSTs the Grok webhook in the background
+1. Returns so Slack gets the ack within the 3s window
+2. Reacts to the message with `ACK_REACTION` (default `white_check_mark`)
+3. Shows a short `is thinking…` status, resolves the user, and POSTs the Grok webhook in the background
 4. Clears the spinner as soon as the webhook is accepted
-5. Posts an instant threaded **hold-ack** so the room knows the bot heard them while the owner reviews
 
-Hold-ack text:
+The reaction is the acknowledgement. It needs `reactions:write`. If that scope is missing, the bridge logs `reactions:write` and continues. If the configured emoji is not installed in the workspace, it logs that and retries with `white_check_mark`. Set `ACK_REACTION=off` to disable the reaction. Emoji names have no colons (`white_check_mark`, not `:white_check_mark:`).
+
+The text hold-ack is **opt-in** (`HOLD_ACK=true`). Leave it off unless you also want a message. When it is on:
 - Generic: "Got it - checking with the owner and will get back to you."
 - Personal/family heuristic (kids, schedule, school, address, etc.): "That's not on my approved list of things to share publicly. Let me check with the owner and get back to you."
 
-Env knobs: `HOLD_ACK` (default true), `HOLD_ACK_BROADCAST` (default true; Also send to channel), `THINKING_TIMEOUT_MS` (default 45000 safety clear), `BRIDGE_SOURCE` (payload `source` field).
+That text follows the [threading rule](#threading). `HOLD_ACK_BROADCAST` (default true) controls whether a **channel** hold-ack is also sent to the channel. DMs are never broadcast.
 
-A later approved `chat.postMessage` is the real answer. Needs `chat:write`.
+Other knobs: `THINKING_TIMEOUT_MS` (default 45000 safety clear), `BRIDGE_SOURCE` (payload `source` field). The HTTP relays use the same acknowledgement. A later `chat.postMessage` is the real answer and needs `chat:write`.
 
-## Outbound replies
+## Threading
 
-Human ack before send unless standing permission. Use `chat.postMessage` with `channel` + `thread_ts`. For channel-visible thread replies (Slack UI “Also send to #channel”), set **`reply_broadcast: true`** on that message — it is a **per-message** API flag, not a YAML/manifest setting.
+Replies land in a different place in DMs than in channels. The Socket Mode bridge and both HTTP relays apply this to messages they post themselves, and they send the same decision on the webhook as `reply: { thread_ts, reply_broadcast }`. `thread_ts` is null when the reply should be top-level. The routine template follows `reply` when it posts.
+
+- **DMs and group DMs:** a normal message. Set `thread_ts` only when the inbound message is already in a thread (`thread_ts` present and different from `ts`). Do not set `reply_broadcast`.
+- **Channels:** reply in the thread (`thread_ts` is the parent, or the message `ts` if it started the thread) and set **`reply_broadcast: true`** so the channel sees it. That flag is per message, not a manifest setting.
+
+`app_mention` often has no `channel_type`. The bridge calls `conversations.info` to tell a group DM from a channel. That needs the matching read scope (`channels:read`, `groups:read`, `im:read`, or `mpim:read`). If the lookup fails, the mention is treated as a channel.
+
+File uploads cannot set `reply_broadcast`. Upload into the thread, then post a separate short message with `reply_broadcast` when the channel should see it. See [`voice/README.md`](voice/README.md).
 
 Invite the bot into channels with `/invite @YourBotDisplayName`.
+
+## Message log, history, and work status
+
+Patterns for the routine, not extra bridge code:
+
+- Log every relayed message, including file ids and mimetypes, to `log/raw/YYYY-MM-DD.jsonl`. Read recent channel or thread history before answering. An optional nightly routine writes `log/summaries/`, refreshes `log/index.md`, and deletes raw logs older than 30 days. [`docs/MESSAGE_LOG.md`](docs/MESSAGE_LOG.md).
+- The main agent keeps `state/active-work.md` current. The Slack routine reads it before status answers so Slack matches the main chat. [`docs/WORK_STATUS.md`](docs/WORK_STATUS.md).
+- Example wake-routine prompt (untrusted payload, allowlist, voice, handoff): [`docs/ROUTINE_PROMPT.example.md`](docs/ROUTINE_PROMPT.example.md).
+
+`log/`, the live status file, and a live `REFERENCE_HISTORY.md` are gitignored.
+
+## Voice replies
+
+[`voice/`](voice/README.md) transcribes Slack audio locally (faster-whisper) and uploads a spoken reply (edge-tts, no API key). Configurable voice, rate, pitch, text file, comment, and a title taken from the clip topic. Needs `ffmpeg` on `PATH`, plus Slack `files:read` and `files:write`.
 
 ## Secrets
 
@@ -174,8 +197,9 @@ After each change the bot should confirm the full short list.
 | Env | Role |
 | --- | --- |
 | `OWNER_DISPLAY_NAME` | Name used in hold-ack text (default `the owner`) |
-| `HOLD_ACK` | Instant threaded ack after webhook (default on) |
-| `HOLD_ACK_BROADCAST` | Also send hold-ack to channel (default on) |
+| `ACK_REACTION` | Emoji added when a message arrives (default `white_check_mark`; `off` disables) |
+| `HOLD_ACK` | Also post the text hold-ack (default off) |
+| `HOLD_ACK_BROADCAST` | When the text hold-ack is on, also send it to the channel (default on) |
 
 The allowlist itself is **not** an env secret; the agent owns it.
 

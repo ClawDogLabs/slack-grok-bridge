@@ -17,18 +17,28 @@ Slack ──HTTPS (signed)──▶ Worker (always on) ──POST + key──▶
 
 ## What it does
 
-Same routing, payload and headers as the bridge, so **an existing wake routine needs no change**.
+Same routing and headers as the bridge. The webhook body adds a `reply` object; a routine that ignores unknown fields needs no change. The text hold-ack is opt-in (`HOLD_ACK=true` keeps the old message). The default acknowledgement is a reaction.
 
 - Verifies `X-Slack-Signature` (v0 HMAC-SHA256, 5-minute timestamp window). Unsigned or bad → `401`.
   No signing secret configured → `503` (fails closed).
 - Answers Slack's `url_verification` handshake by echoing `challenge`.
 - Acks every event within milliseconds; all slow work (user lookup, webhook, Slack posts) runs in
   `ctx.waitUntil`, so Slack's 3-second deadline is never at risk.
-- `app_mention` (human, or a bot in `ALLOW_BOT_IDS` / `ALLOW_BOT_USER_IDS`) → thinking status →
-  webhook `kind: "app_mention"` → hold-ack in thread. On webhook failure it posts
-  "Could not reach Grok webhook…" in the thread.
-- `message` in a DM (`im`) or group DM (`mpim`) → webhook `kind: "message"` + hold-ack.
+- `app_mention` (human, or a bot in `ALLOW_BOT_IDS` / `ALLOW_BOT_USER_IDS`) → reaction ack →
+  thinking status → webhook `kind: "app_mention"`. On webhook failure it posts
+  "Could not reach Grok webhook…" using the threading rule below.
+- `message` in a DM (`im`) or group DM (`mpim`) → reaction ack → webhook `kind: "message"`.
   An explicit @mention in a group DM is handled once, via `app_mention`.
+- The reaction emoji is `ACK_REACTION` (default `white_check_mark`). A missing custom emoji
+  falls back to `white_check_mark`. A missing `reactions:write` scope is logged and the wake
+  still happens. Set `ACK_REACTION` to `off` to disable. The text hold-ack is opt-in
+  (`HOLD_ACK=true`) and follows the same placement as a real reply.
+- **Threading.** DMs and group DMs get a plain reply unless the message is already in a
+  thread. Channels get a thread reply with `reply_broadcast`. The webhook includes
+  `reply: { thread_ts, reply_broadcast }` (`thread_ts` is null for a top-level DM).
+  `app_mention` has no `channel_type`; the Worker calls `conversations.info` when it can
+  (`channels:read`, `groups:read`, `im:read`, or `mpim:read`). If that call fails, the
+  mention is treated as a channel.
 - Bots (including itself), edits, deletes and other subtypes are ignored, except `file_share`
   (a user posting an image or PDF), which is forwarded with a `files` array.
 - Every event response carries a debug header `X-Relay-Action: <action>:<reason>`.
@@ -37,18 +47,23 @@ Same routing, payload and headers as the bridge, so **an existing wake routine n
 Webhook request (identical to the bridge):
 `POST GROK_WEBHOOK_URL` with `Authorization: Bearer <GROK_WEBHOOK_SECRET>` and
 `X-Automation-Key: <GROK_WEBHOOK_SECRET>`, body
-`{ source, kind, slack: { type, user, user_name, user_real_name, user_display_name, channel, channel_type, ts, thread_ts, text, subtype, files }, hold_ack }`.
+`{ source, kind, slack: { type, user, user_name, user_real_name, user_display_name, channel, channel_type, ts, thread_ts, text, subtype, files }, hold_ack, reply }`.
+`reply` is `{ thread_ts, reply_broadcast }`. `thread_ts` is null when the routine should post a top-level message.
 
-### Optional extras (off by default)
+### More config
 
 | Var | Effect |
 |-----|--------|
-| `WATCH_CHANNEL_IDS` | Forward messages in these channels **without** an @mention, as `{ kind: "channel_message", watched: true, slack }` (no thinking / hold-ack). A cheap pre-filter skips short chatter: forwarded only if it has `BOT_NAME`, a `?`, or more than 4 words. Your routine must decide whether to answer. |
+| `WATCH_CHANNEL_IDS` | Forward messages in these channels **without** an @mention, as `{ kind: "channel_message", watched: true, slack, reply }` (no thinking, reaction, or hold-ack). A cheap pre-filter skips short chatter: forwarded only if it has `BOT_NAME`, a `?`, or more than 4 words. Your routine must decide whether to answer. |
+| `ACK_REACTION` | Emoji name without colons (default `white_check_mark`). `off` disables the reaction. A missing custom emoji falls back to `white_check_mark`. Missing `reactions:write` is logged. |
+| `HOLD_ACK` | `"true"` also posts the text hold-ack. Default off, so a new deploy does not double-ack. |
+| `HOLD_ACK_BROADCAST` | When the text hold-ack is on, also send it to the channel (default true). DMs are never broadcast. |
+| `HOLD_ACK_SKIP_REGEX` | Asks matching this regex get no text hold-ack (e.g. off-topic questions your routine will politely decline). |
 | `WELCOME_CHANNEL_IDS`, `WELCOME_TEXT`, `ASK_CHANNEL_ID` | New human joiners get a :wave: reaction and `WELCOME_TEXT` (`{user}`, `{ask_channel}` placeholders). Needs `reactions:write`. |
 | `BOT_NAME`, `MPIM_REQUIRE_ADDRESS` | With `MPIM_REQUIRE_ADDRESS="true"`, group DMs only wake the bot when it's @mentioned or `BOT_NAME` appears. |
-| `HOLD_ACK_DM_TOP_LEVEL` | `"true"` posts the DM hold-ack as a normal message instead of a thread reply. |
-| `HOLD_ACK_SKIP_REGEX` | Asks matching this regex get no hold-ack (e.g. off-topic questions your routine will politely decline). |
 | `RETRY_POLICY` | See below. |
+
+`HOLD_ACK_DM_TOP_LEVEL` is no longer read. DM and group-DM placement follows the threading rule above. `ACK_REACTION` defaults on and `HOLD_ACK` defaults off. Watched-channel forwards still do not react or post a hold-ack. The other rows stay off until you set them.
 
 ### Slack retries and Delayed Events
 
@@ -96,7 +111,9 @@ works on Node 18/20. Wrangler v4 needs Node 20+ (or newer, check its release not
    printf '%s' "$SLACK_SIGNING_SECRET" | npx wrangler secret put SLACK_SIGNING_SECRET
    ```
    The signing secret is under api.slack.com → your app → **Basic Information → App Credentials →
-   Signing Secret**. Check `curl https://<worker-url>/health` shows `"configured":true` **before**
+   Signing Secret**. The bot token needs `reactions:write` for the ack emoji, and `files:write`
+   as well if the routine uploads voice replies. Reinstall the Slack app after adding scopes.
+   Check `curl https://<worker-url>/health` shows `"configured":true` **before**
    switching Slack over.
 5. **Smoke-test without Slack.** An unsigned POST must get `401`:
    `curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<worker-url>/slack/events -d '{}'`
