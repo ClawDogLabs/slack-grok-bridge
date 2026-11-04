@@ -97,7 +97,7 @@ Optional: set webhook payload `source` in `index.js` to identify your bridge (de
 display_information:
   name: YOUR_BOT_NAME
   description: Grok Bot bridge
-  long_description: Socket Mode Slack bridge that wakes this person's Grok Bot on @mentions and DMs, then posts replies back into threads.
+  long_description: Socket Mode Slack bridge that wakes this person's Grok Bot on @mentions and DMs, then posts channel replies in threads and DM replies as normal messages.
   background_color: "#1a1a2e"
 features:
   bot_user:
@@ -113,6 +113,8 @@ oauth_config:
       - channels:history
       - groups:history
       - files:read
+      - files:write
+      - reactions:write
       - users:read
 settings:
   event_subscriptions:
@@ -136,7 +138,13 @@ The bot should guide you through these clicks individually:
 6. Give both copied values to the bot only through its **secret-request** prompts. **Never paste them into chat.**
 7. Confirm Socket Mode is on and events include `app_mention` + `message.im`. Reinstall if scopes change later.
 
-**`files:read` scope:** required so the bridge (or messenger) can call `files.info` / download attached images when someone says "send me this screenshot". After adding the scope, reinstall the app to the workspace and refresh the bot token (`xoxb-…`) in `.env`, then restart the bridge.
+**`reactions:write` scope:** required so the bridge can add the acknowledgement emoji (`ACK_REACTION`, default `white_check_mark`). If the scope is missing, the bridge logs that and still wakes the routine. A custom emoji that is not installed falls back to `white_check_mark`.
+
+**`files:read` scope:** required so the bridge (or the routine) can call `files.info` / download attachments, including audio clips for [`voice/`](voice/README.md).
+
+**`files:write` scope:** required to upload a spoken reply (`voice/speak_reply.py`). Uploads cannot set `reply_broadcast`; the script posts a separate message when you pass `--broadcast`.
+
+After adding a scope, reinstall the app to the workspace and refresh the bot token in `.env`, then restart the bridge.
 
 Invite bots into channels with `/invite @BotDisplayName`.
 
@@ -260,15 +268,17 @@ Use e.g. **`:21` / `:51`** past the hour (twice-hourly weekday daytime). `ensure
 ## Outbound replies
 
 - **Human ack before send** unless standing permission for that channel/use
-- `chat.postMessage` with `channel` + `thread_ts` (inbound `thread_ts` or parent `ts`)
-- For channel-visible thread replies (Slack “Also send to #channel”), set **`reply_broadcast: true`** — per-message API flag, **not** a YAML/manifest setting
+- Prefer the webhook `reply` object. It already applies the threading rule.
+- **DMs and group DMs:** `chat.postMessage` with `channel` only. Set `thread_ts` only when the inbound message is already in a thread. Do not set `reply_broadcast`.
+- **Channels:** `thread_ts` (inbound `thread_ts`, or the message `ts`) and **`reply_broadcast: true`** (Slack “Also send to #channel”). That flag is per message, **not** a YAML/manifest setting.
 
 ```js
+// Channel. For a top-level DM, omit thread_ts and reply_broadcast.
 await client.chat.postMessage({
   channel,
   thread_ts: threadTs,
   text: replyText,
-  reply_broadcast: true, // Also send to #channel
+  reply_broadcast: true,
 });
 ```
 
@@ -286,7 +296,7 @@ await client.chat.postMessage({
 | Own webhook routine + `GROK_WEBHOOK_*` | URL + sender key in `.env`; Bearer + X-Automation-Key |
 | `npm install` + `./start.sh` | `bridge.log` shows Socket Mode |
 | Keep-alive | Weekday daytime `ensure-running` |
-| Invite + smoke `@mention` | Bot wakes; reply uses `thread_ts` (+ `reply_broadcast` if desired) |
+| Invite + smoke `@mention` | Bot reacts, wakes, and a channel reply uses `thread_ts` + `reply_broadcast`. A DM reply is top-level. |
 
 ---
 
@@ -295,19 +305,23 @@ await client.chat.postMessage({
 - Template README: [README.md](./README.md)
 - Repo: https://github.com/ClawDogLabs/slack-grok-bridge
 
-## Instant hold-ack (privacy)
+## Acknowledgement (reaction, optional text)
 
-After waking Grok, the bridge posts a short threaded reply so the channel is not stuck on "thinking…":
+When a message arrives, the bridge reacts with `ACK_REACTION` (default `white_check_mark`). That needs `reactions:write`. Set `ACK_REACTION=off` to disable it.
+
+The text hold-ack is off unless `HOLD_ACK=true`. When you turn it on:
 - Generic asks: checking with the owner
 - Personal/family heuristic: refuse public share + check with owner
 
-Real answers still need human approval before a substantive `chat.postMessage`. Set `HOLD_ACK=false` to disable. Template: this repo's `index.js`.
+The text follows the threading rule. Real answers still need human approval before a substantive `chat.postMessage` unless the owner share allowlist already covers them. Template: this repo's `index.js` and `cloudflare-relay/src/index.js`.
+
+Example routine prompt: [`docs/ROUTINE_PROMPT.example.md`](docs/ROUTINE_PROMPT.example.md). It covers the untrusted webhook body, the message log, voice, the work-status file, and handing real work back to the main agent.
 
 ## Owner share allowlist
 
 1. Copy `OWNER_SHARE_POLICY.example.md` → `OWNER_SHARE_POLICY.md` next to the live bridge (or manage only in Grok memory).
 2. Tell your Grok Bot the initial allow/deny entries; it should save memory + the file.
-3. Set `OWNER_DISPLAY_NAME` in `.env` so hold-ack names you.
+3. Set `OWNER_DISPLAY_NAME` in `.env` so a text hold-ack (if you enable it) names you.
 4. Point the messenger routine at: consult allowlist before send; default deny; ask before expanding the list.
 5. Owners manage the list in chat (`add` / `remove` / `don't share X`). See README "Owner share allowlist".
 

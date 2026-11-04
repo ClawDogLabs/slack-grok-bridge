@@ -1,7 +1,7 @@
 # Owner share policy (example)
 
 Copy to `OWNER_SHARE_POLICY.md` beside your live bridge (or keep only in Grok memory).
-**Each owner has their own list.** Default: deny.
+The live file is gitignored. **Each owner has their own list.** Default: deny.
 
 ## Allow without new approval
 

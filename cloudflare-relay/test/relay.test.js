@@ -1,7 +1,7 @@
 // Offline tests: no network. Run with `npm test` (Node 20+).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import worker, { route, cfg, dropRetry, slackSignature } from "../src/index.js";
+import worker, { route, cfg, dropRetry, slackSignature, ackEmoji, replyFields, postMessageArgs } from "../src/index.js";
 
 const SECRET = "test-signing-secret";
 const ME = "UBOT0001";
@@ -74,6 +74,145 @@ test("routing", () => {
   const strict = cfg({ ...baseEnv, MPIM_REQUIRE_ADDRESS: "true", BOT_NAME: "mybot" });
   assert.equal(route({ type: "message", channel_type: "mpim", channel: "G1", user: "UHUMAN", text: "lunch?" }, strict).action, "ignore");
   assert.equal(route({ type: "message", channel_type: "mpim", channel: "G1", user: "UHUMAN", text: "mybot lunch?" }, strict).action, "wake_dm");
+});
+
+test("ack emoji and reply placement", () => {
+  assert.equal(ackEmoji(undefined), "white_check_mark");
+  assert.equal(ackEmoji(""), "white_check_mark");
+  assert.equal(ackEmoji(":thumbsup:"), "thumbsup");
+  assert.equal(ackEmoji("off"), null);
+  assert.equal(ackEmoji("false"), null);
+  assert.equal(ackEmoji("none"), null);
+  assert.equal(cfg({}).holdAck, false);
+  assert.equal(cfg({ HOLD_ACK: "true" }).holdAck, true);
+  assert.equal(cfg({}).ackReaction, "white_check_mark");
+  assert.equal(cfg({ ACK_REACTION: "off" }).ackReaction, null);
+
+  assert.deepEqual(replyFields({ channel: "D1", channel_type: "im", ts: "1.1" }), { thread_ts: null, reply_broadcast: false });
+  assert.deepEqual(replyFields({ channel: "D1", channel_type: "im", ts: "2.2", thread_ts: "1.1" }), { thread_ts: "1.1", reply_broadcast: false });
+  assert.deepEqual(replyFields({ channel: "G1", channel_type: "mpim", ts: "1.1" }), { thread_ts: null, reply_broadcast: false });
+  assert.deepEqual(replyFields({ channel: "C1", channel_type: "channel", ts: "1.1" }), { thread_ts: "1.1", reply_broadcast: true });
+  assert.deepEqual(replyFields({ channel: "C1", channel_type: "channel", ts: "2.2", thread_ts: "1.1" }), { thread_ts: "1.1", reply_broadcast: true });
+  assert.deepEqual(replyFields({ channel: "C1", ts: "1.1" }), { thread_ts: "1.1", reply_broadcast: true });
+  assert.deepEqual(replyFields({ channel: "D9", ts: "1.1" }), { thread_ts: null, reply_broadcast: false });
+  assert.deepEqual(
+    postMessageArgs("D1", "hi", { thread_ts: null, reply_broadcast: false }),
+    { channel: "D1", text: "hi" },
+  );
+  assert.deepEqual(
+    postMessageArgs("C1", "hi", { thread_ts: "1.1", reply_broadcast: true }),
+    { channel: "C1", text: "hi", thread_ts: "1.1", reply_broadcast: true },
+  );
+});
+
+function jsonResponse(obj, status = 200) {
+  return new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+}
+
+// node:test runs cases concurrently. These share global fetch, so queue them.
+let fetchChain = Promise.resolve();
+function withMockFetch(impl, fn) {
+  const run = fetchChain.then(async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = impl;
+    try {
+      await fn();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+  fetchChain = run.then(() => {}, () => {});
+  return run;
+}
+
+test("reaction ack falls back when the custom emoji is missing and does not post a text hold-ack", async () => {
+  const calls = [];
+  await withMockFetch(async (url, opts = {}) => {
+    const u = String(url);
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    calls.push({ url: u, body });
+    if (u.includes("reactions.add")) {
+      if (body.name === "party_parrot") return jsonResponse({ ok: false, error: "invalid_name" });
+      return jsonResponse({ ok: true });
+    }
+    if (u.includes("users.info")) return jsonResponse({ ok: true, user: { id: "UHUMAN", name: "someone", profile: {} } });
+    if (u.includes("assistant.threads")) return jsonResponse({ ok: true });
+    return new Response("ok", { status: 200 });
+  }, async () => {
+    const { waited } = await post(
+      { type: "event_callback", event: { type: "message", channel_type: "im", channel: "D1", user: "UHUMAN", text: "hello there", ts: "1.1" } },
+      { env: { ...baseEnv, SLACK_BOT_TOKEN: "xoxb-test", ACK_REACTION: "party_parrot", GROK_WEBHOOK_URL: "https://example.test/hook" } },
+    );
+    await Promise.all(waited);
+    const reactions = calls.filter((c) => c.url.includes("reactions.add")).map((c) => c.body.name);
+    assert.deepEqual(reactions, ["party_parrot", "white_check_mark"]);
+    assert.equal(calls.some((c) => c.url.includes("chat.postMessage")), false);
+    const wake = calls.find((c) => c.url.includes("example.test/hook"));
+    assert.equal(wake.body.reply.thread_ts, null);
+    assert.equal(wake.body.reply.reply_broadcast, false);
+  });
+});
+
+test("missing reactions:write is not retried with another emoji", async () => {
+  const calls = [];
+  await withMockFetch(async (url, opts = {}) => {
+    const u = String(url);
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    calls.push({ url: u, body });
+    if (u.includes("reactions.add")) return jsonResponse({ ok: false, error: "missing_scope" });
+    if (u.includes("users.info")) return jsonResponse({ ok: true, user: { id: "UHUMAN", name: "someone", profile: {} } });
+    if (u.includes("assistant.threads")) return jsonResponse({ ok: true });
+    if (u.includes("conversations.info")) return jsonResponse({ ok: false, error: "missing_scope" });
+    return new Response("ok", { status: 200 });
+  }, async () => {
+    const { waited } = await post(
+      { type: "event_callback", event: { type: "app_mention", channel: "C1", user: "UHUMAN", text: `<@${ME}> hi`, ts: "3.3" } },
+      { env: { ...baseEnv, SLACK_BOT_TOKEN: "xoxb-test", ACK_REACTION: "custom_ack", GROK_WEBHOOK_URL: "https://example.test/hook" } },
+    );
+    await Promise.all(waited);
+    const reactions = calls.filter((c) => c.url.includes("reactions.add"));
+    assert.equal(reactions.length, 1);
+    assert.equal(reactions[0].body.name, "custom_ack");
+    const wake = calls.find((c) => c.url.includes("example.test/hook"));
+    assert.ok(wake, "webhook was called");
+    assert.equal(wake.body.reply.thread_ts, "3.3");
+    assert.equal(wake.body.reply.reply_broadcast, true);
+  });
+});
+
+test("opt-in text hold-ack follows the threading rule", async () => {
+  const calls = [];
+  await withMockFetch(async (url, opts = {}) => {
+    const u = String(url);
+    calls.push({ url: u, body: opts.body ? JSON.parse(opts.body) : null });
+    if (u.includes("conversations.info")) {
+      const mpim = u.includes("channel=G1");
+      return jsonResponse({ ok: true, channel: { is_mpim: mpim, is_channel: !mpim } });
+    }
+    if (u.includes("chat.postMessage") || u.includes("reactions.add") || u.includes("assistant.threads") || u.includes("users.info")) {
+      return jsonResponse({ ok: true, user: { id: "UHUMAN", name: "someone", profile: {} } });
+    }
+    return new Response("ok", { status: 200 });
+  }, async () => {
+    const env = { ...baseEnv, SLACK_BOT_TOKEN: "xoxb-test", HOLD_ACK: "true", ACK_REACTION: "off", GROK_WEBHOOK_URL: "https://example.test/hook" };
+    const channelMention = await post(
+      { type: "event_callback", event: { type: "app_mention", channel: "C1", user: "UHUMAN", text: `<@${ME}> status?`, ts: "5.5" } },
+      { env },
+    );
+    await Promise.all(channelMention.waited);
+    const groupDm = await post(
+      { type: "event_callback", event: { type: "app_mention", channel: "G1", user: "UHUMAN", text: `<@${ME}> status?`, ts: "6.6" } },
+      { env },
+    );
+    await Promise.all(groupDm.waited);
+    const posts = calls.filter((c) => c.url.includes("chat.postMessage")).map((c) => c.body);
+    assert.equal(posts.length, 2);
+    assert.equal(posts[0].thread_ts, "5.5");
+    assert.equal(posts[0].reply_broadcast, true);
+    assert.equal(posts[1].thread_ts, undefined);
+    assert.equal(posts[1].reply_broadcast, undefined);
+    assert.equal(calls.some((c) => c.url.includes("reactions.add")), false);
+  });
 });
 
 test("event responses are immediate and carry the routing decision", async () => {
