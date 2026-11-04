@@ -11,6 +11,11 @@
  *                                GROK_WEBHOOK_SECRET (optional but recommended)
  * Vars (wrangler.toml [vars]):   see wrangler.toml.example
  *
+ * Acknowledgement is a reaction (ACK_REACTION, default white_check_mark). The text
+ * hold-ack is opt-in (HOLD_ACK=true). Replies the Worker itself posts follow the
+ * threading rule: plain in DMs/group DMs unless already threaded; thread +
+ * reply_broadcast in channels. The same placement is sent as `reply` on the webhook.
+ *
  * Every request is answered fast (200 within ms); slow work runs in ctx.waitUntil so Slack's
  * 3-second deadline is never at risk.
  */
@@ -30,6 +35,39 @@ const isTrue = (v, dflt) => (v === undefined || v === null || v === "" ? dflt : 
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
+/** Slack emoji name (no colons). Empty uses the default. "off" / "false" / "none" disables the reaction. */
+export const DEFAULT_ACK_EMOJI = "white_check_mark";
+export function ackEmoji(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return DEFAULT_ACK_EMOJI;
+  const name = String(value).trim().replace(/^:+|:+$/g, "");
+  if (!name || /^(off|false|none|0)$/i.test(name)) return null;
+  return name;
+}
+
+/**
+ * Where a reply to this event belongs.
+ * DMs and group DMs stay top-level unless the message is already in a thread.
+ * Channels (and private channels) reply in a thread and also broadcast to the channel.
+ * A channel id starting with D is a DM even when channel_type was not on the event.
+ * `thread_ts` is null when the reply should be top-level.
+ */
+export function replyFields(event) {
+  const channel = String(event?.channel || "");
+  const ct = event?.channel_type;
+  const isDm = ct === "im" || ct === "mpim" || channel.startsWith("D");
+  const parent = event?.thread_ts && event.thread_ts !== event?.ts ? event.thread_ts : null;
+  if (isDm) return { thread_ts: parent, reply_broadcast: false };
+  return { thread_ts: parent || event?.ts || null, reply_broadcast: true };
+}
+
+/** chat.postMessage args. Omits thread_ts / reply_broadcast when the placement doesn't use them. */
+export function postMessageArgs(channel, text, fields) {
+  const body = { channel, text };
+  if (fields?.thread_ts) body.thread_ts = fields.thread_ts;
+  if (fields?.reply_broadcast) body.reply_broadcast = true;
+  return body;
+}
+
 // Own ids: from vars if set, else looked up once per isolate with auth.test.
 let selfCache = null;
 
@@ -43,9 +81,10 @@ export function cfg(env) {
   return {
     source: env.BRIDGE_SOURCE || "slack-grok-bridge",
     owner,
-    holdAck: isTrue(env.HOLD_ACK, true),
+    // Text hold-ack is opt-in. The default acknowledgement is a reaction (see ackReaction).
+    holdAck: isTrue(env.HOLD_ACK, false),
     holdAckBroadcast: isTrue(env.HOLD_ACK_BROADCAST, true),
-    holdAckDmTopLevel: isTrue(env.HOLD_ACK_DM_TOP_LEVEL, false),
+    ackReaction: ackEmoji(env.ACK_REACTION),
     holdAckSkip,
     holdAckGeneric: `Got it - checking with ${owner} and will get back to you.`,
     holdAckPersonal: `That's not on my approved list of things to share publicly. Let me check with ${owner} and get back to you.`,
@@ -160,7 +199,7 @@ export function dropRetry(reason, c) {
 }
 
 // ---------------------------------------------------------------- Slack Web API
-async function slackApi(env, method, body, { get = false } = {}) {
+async function slackApi(env, method, body, { get = false, quiet = false } = {}) {
   const url = `https://slack.com/api/${method}`;
   const headers = { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` };
   let res;
@@ -171,8 +210,56 @@ async function slackApi(env, method, body, { get = false } = {}) {
     res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
   }
   const data = await res.json().catch(() => ({ ok: false, error: `http_${res.status}` }));
-  if (!data.ok) log(`slack ${method} failed:`, data.error);
+  if (!data.ok && !quiet) log(`slack ${method} failed:`, data.error);
   return data;
+}
+
+const channelKindCache = new Map();
+let loggedChannelScope = false;
+
+/** Fill in channel_type when the event omitted it (app_mention does). Failures are not cached. */
+async function resolveChannelType(env, e) {
+  const ct = e?.channel_type;
+  if (ct === "im" || ct === "mpim" || ct === "channel" || ct === "group") return ct;
+  const channel = String(e?.channel || "");
+  if (channel.startsWith("D")) return "im";
+  if (!channel || !env.SLACK_BOT_TOKEN) return "channel";
+  if (channelKindCache.has(channel)) return channelKindCache.get(channel);
+  const info = await slackApi(env, "conversations.info", { channel }, { get: true, quiet: true }).catch(() => null);
+  if (!info?.ok || !info.channel) {
+    if (info?.error === "missing_scope" && !loggedChannelScope) {
+      loggedChannelScope = true;
+      log("conversations.info missing scope; @mentions without channel_type are treated as channels. Add channels:read, groups:read, im:read, or mpim:read to classify group DMs.");
+    }
+    return "channel";
+  }
+  const ch = info.channel;
+  const kind = ch.is_im ? "im" : ch.is_mpim ? "mpim" : (ch.is_group || ch.is_private) ? "group" : "channel";
+  channelKindCache.set(channel, kind);
+  return kind;
+}
+
+/** React to the message that just arrived. Custom emoji missing → white_check_mark. Missing scope is logged once per call. */
+async function addAckReaction(env, c, channel, ts) {
+  if (!c.ackReaction || !channel || !ts) return;
+  const name = c.ackReaction;
+  const res = await slackApi(env, "reactions.add", { channel, timestamp: ts, name }, { quiet: true }).catch((err) => ({ ok: false, error: err?.message || "request_failed" }));
+  if (res?.ok || res?.error === "already_reacted") return;
+  if (res?.error === "missing_scope") {
+    log("ack reaction skipped: bot token is missing reactions:write (add the scope and reinstall the app)");
+    return;
+  }
+  if ((res?.error === "invalid_name" || res?.error === "emoji_not_found") && name !== DEFAULT_ACK_EMOJI) {
+    log(`ack reaction :${name}: is not available; falling back to :${DEFAULT_ACK_EMOJI}:`);
+    const fallback = await slackApi(env, "reactions.add", { channel, timestamp: ts, name: DEFAULT_ACK_EMOJI }, { quiet: true }).catch((err) => ({ ok: false, error: err?.message || "request_failed" }));
+    if (fallback?.error === "missing_scope") {
+      log("ack reaction skipped: bot token is missing reactions:write (add the scope and reinstall the app)");
+    } else if (!fallback?.ok && fallback?.error !== "already_reacted") {
+      log("ack reaction fallback failed:", fallback?.error || "unknown");
+    }
+    return;
+  }
+  if (res?.error) log("ack reaction failed:", res.error);
 }
 
 async function ensureSelf(env) {
@@ -239,34 +326,42 @@ const setThinking = (env, c, channel, threadTs) =>
 const clearThinking = (env, channel, threadTs) =>
   slackApi(env, "assistant.threads.setStatus", { channel_id: channel, thread_ts: threadTs, status: "" }).catch(() => {});
 
-async function postHoldAck(env, c, channel, threadTs, text, topLevel) {
-  if (!c.holdAck || !channel || !threadTs) return;
+async function postHoldAck(env, c, channel, fields, text) {
+  if (!c.holdAck || !channel) return;
   if (c.holdAckSkip && c.holdAckSkip.test(String(text || ""))) return log("hold-ack skipped (HOLD_ACK_SKIP_REGEX)");
   const body = c.personalRe.test(String(text || "")) ? c.holdAckPersonal : c.holdAckGeneric;
-  await slackApi(env, "chat.postMessage", topLevel
-    ? { channel, text: body }
-    : { channel, thread_ts: threadTs, text: body, reply_broadcast: c.holdAckBroadcast }).catch(() => {});
+  const placement = fields?.reply_broadcast ? { ...fields, reply_broadcast: c.holdAckBroadcast } : fields;
+  await slackApi(env, "chat.postMessage", postMessageArgs(channel, body, placement)).catch(() => {});
 }
 
 // ---------------------------------------------------------------- handlers (run in waitUntil)
 async function processInbound(env, c, kind, e, sayOnFail) {
   const channel = e.channel;
   const threadTs = e.thread_ts || e.ts;
+  const placement = replyFields(e);
+  await addAckReaction(env, c, channel, e.ts);
   await setThinking(env, c, channel, threadTs);
   try {
     const slack = await summarizeEvent(env, e);
-    await wakeGrok(env, { source: c.source, kind, slack, hold_ack: c.personalRe.test(String(slack.text || "")) ? "personal" : "generic" });
+    await wakeGrok(env, {
+      source: c.source,
+      kind,
+      slack,
+      hold_ack: c.personalRe.test(String(slack.text || "")) ? "personal" : "generic",
+      reply: placement,
+    });
     log("wake ok", kind, channel, e.ts);
     await clearThinking(env, channel, threadTs);
-    const isDm = e.channel_type === "im" || e.channel_type === "mpim";
-    await postHoldAck(env, c, channel, threadTs, slack.text, c.holdAckDmTopLevel && isDm && !e.thread_ts);
+    await postHoldAck(env, c, channel, placement, slack.text);
   } catch (err) {
     log("wake FAILED", kind, channel, e.ts, err?.message || err);
     await clearThinking(env, channel, threadTs);
     if (sayOnFail) {
-      await slackApi(env, "chat.postMessage", {
-        channel, thread_ts: threadTs, text: "Could not reach Grok webhook. Check GROK_WEBHOOK_URL / secret.",
-      }).catch(() => {});
+      await slackApi(env, "chat.postMessage", postMessageArgs(
+        channel,
+        "Could not reach Grok webhook. Check GROK_WEBHOOK_URL / secret.",
+        placement,
+      )).catch(() => {});
     }
   }
 }
@@ -274,7 +369,7 @@ async function processInbound(env, c, kind, e, sayOnFail) {
 async function forwardWatched(env, c, e) {
   try {
     const slack = await summarizeEvent(env, e);
-    await wakeGrok(env, { source: c.source, kind: "channel_message", watched: true, slack });
+    await wakeGrok(env, { source: c.source, kind: "channel_message", watched: true, slack, reply: replyFields(e) });
     log("wake ok", "channel_message", e.channel, e.ts);
   } catch (err) {
     log("wake FAILED", "channel_message", e.channel, e.ts, err?.message || err);
@@ -292,10 +387,11 @@ async function welcome(env, c, e) {
 }
 
 async function handle(env, c, e, action) {
-  if (action === "wake_mention") return processInbound(env, c, "app_mention", e, true);
-  if (action === "wake_dm") return processInbound(env, c, "message", e, false);
-  if (action === "watched") return forwardWatched(env, c, e);
   if (action === "welcome") return welcome(env, c, e);
+  const event = { ...e, channel_type: await resolveChannelType(env, e) };
+  if (action === "wake_mention") return processInbound(env, c, "app_mention", event, true);
+  if (action === "wake_dm") return processInbound(env, c, "message", event, false);
+  if (action === "watched") return forwardWatched(env, c, event);
 }
 
 // ---------------------------------------------------------------- entry

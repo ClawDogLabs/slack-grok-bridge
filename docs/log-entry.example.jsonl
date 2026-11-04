@@ -1,0 +1,1 @@
+{"at":"2026-01-15T12:00:00Z","kind":"message","channel":"<channel-id>","channel_type":"im","ts":"<message-ts>","thread_ts":null,"user":"<user-id>","text":"short text of the message","files":[{"id":"<file-id>","name":"clip.m4a","mimetype":"audio/mp4","filetype":"m4a"}],"action":"replied"}

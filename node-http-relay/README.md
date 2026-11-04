@@ -3,7 +3,7 @@
 A plain **Node 20+** HTTP server that does exactly what [`../cloudflare-relay/`](../cloudflare-relay/README.md)
 does: verify Slack's signature, answer `url_verification`, ack fast, and forward events to your
 Grok Bot routine webhook. It **imports the Worker module** (`../cloudflare-relay/src/index.js`), so
-routing, payload, headers, retry policy and hold-ack behavior are identical. `server.js` is only
+routing, payload, headers, retry policy and reaction-ack behavior are identical. `server.js` is only
 an adapter (Node request → web `Request`, `process.env` → `env`, a real `ctx.waitUntil`).
 
 No dependencies. Use it on any host that keeps a process running: Fly.io, Railway, Render,
@@ -21,7 +21,7 @@ Environment variables, same names as the Worker (see [`.env.example`](./.env.exa
 | Var | Required | Notes |
 | --- | --- | --- |
 | `SLACK_SIGNING_SECRET` | yes | api.slack.com → your app → Basic Information → Signing Secret. Missing → every POST gets `503` (fails closed). |
-| `SLACK_BOT_TOKEN` | yes | `xoxb-…`, for user lookups, thinking status and hold-ack. |
+| `SLACK_BOT_TOKEN` | yes | Bot token, for user lookups, the ack reaction, and thinking status. Needs `reactions:write`. |
 | `GROK_WEBHOOK_URL` | yes | Your Grok routine's webhook URL. |
 | `GROK_WEBHOOK_SECRET` | recommended | Sent as `Authorization: Bearer …` and `X-Automation-Key`. |
 | `PORT` / `HOST` | no | Default `8080` / `0.0.0.0`. |
