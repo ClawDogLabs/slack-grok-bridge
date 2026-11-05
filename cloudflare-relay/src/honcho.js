@@ -8,8 +8,13 @@
  * Honcho ids only allow [A-Za-z0-9_-], so the id is a prefix plus the channel id,
  * not channel:id. One session keeps that room together for a later on-demand read.
  *
- * Peer id is the Slack user id. Message content is "<author>: <text>" when a
- * display name or user id is available. slack_ts is stored on metadata.
+ * Peer id is the Slack user id (U... or W...). A log label such as "dinky" is
+ * never used as a peer id. Message content is "<author>: <text>" when a display
+ * name or user id is available. slack_ts is stored on metadata.
+ *
+ * Channel scope: channel_type "channel" is public. A C id is not. Group DMs can
+ * also use C ids. When type is missing, HONCHO_CHANNEL_IDS wins, then a working
+ * conversations.info lookup. Otherwise ingest fails closed (needs-channel-type).
  *
  * Privacy: the same personal-term heuristic as looksPersonal() / the owner share
  * hold list (family, schedule, address, phone, email, ...), plus tokens, key URLs,
@@ -48,7 +53,9 @@ const FINANCE_RES = [
 
 const HUMAN_SUBTYPES = new Set(["file_share", "slack_audio", "thread_broadcast", "me_message"]);
 const OWN_SUBTYPES = new Set([...HUMAN_SUBTYPES, "bot_message"]);
-const LOUD_SKIP = new Set(["personal", "secret", "address", "finance"]);
+const LOUD_SKIP = new Set(["personal", "secret", "address", "finance", "needs-channel-type", "not-allowlisted"]);
+const SLACK_USER_ID = /^[UW][A-Z0-9]+$/;
+const lookupCache = new Map();
 
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -70,6 +77,7 @@ export function resetHonchoState() {
   globalState.sessions.clear();
   globalState.members.clear();
   globalState.seen.clear();
+  lookupCache.clear();
 }
 
 function stateOf(opts) {
@@ -98,12 +106,112 @@ export function buildPersonalRe(extraNames) {
   return new RegExp(`\\b(${[...names, ...PERSONAL_BASE_TERMS].join("|")})\\b`, "i");
 }
 
+/** Comma-separated Slack channel ids. Empty / unset means no allowlist. */
+export function parseChannelIds(value) {
+  if (value == null) return null;
+  if (value instanceof Set) return value.size ? value : null;
+  const ids = String(value).split(",").map((s) => s.trim()).filter(Boolean);
+  return ids.length ? new Set(ids) : null;
+}
+
+export function isSlackUserId(value) {
+  return SLACK_USER_ID.test(String(value || "").trim());
+}
+
+/** Built-in "dinky" plus any extra bot labels (BOT_NAME, auth.test username). */
+export function botLabelSet(extra) {
+  const labels = new Set(["dinky"]);
+  const list = Array.isArray(extra) ? extra : String(extra || "").split(",");
+  for (const item of list) {
+    const label = String(item || "").trim().toLowerCase().replace(/^@/, "");
+    if (label) labels.add(label);
+  }
+  return labels;
+}
+
+/**
+ * Log user "dinky" (and the same kind of bot label) becomes OWN_USER_ID.
+ * Anything that is not a Slack user id and not a known bot label is refused.
+ */
+export function mapLogPeer(user, { ownUserId, labels } = {}) {
+  const raw = String(user || "").trim();
+  if (isSlackUserId(raw)) return { peerId: raw, display: null, mapped: false };
+  const label = raw.toLowerCase().replace(/^@/, "");
+  if (label && labels?.has(label)) {
+    if (!isSlackUserId(ownUserId)) return { peerId: null, display: raw, mapped: true, reason: "no-peer" };
+    return { peerId: String(ownUserId).trim(), display: raw, mapped: true };
+  }
+  return { peerId: null, display: raw, mapped: false, reason: "no-peer" };
+}
+
+/** Slack conversations.info channel object -> im | mpim | group | channel. */
+export function channelKindFromInfo(channel) {
+  if (!channel || typeof channel !== "object") return null;
+  if (channel.is_im) return "im";
+  if (channel.is_mpim) return "mpim";
+  if (channel.is_private || channel.is_group) return "group";
+  return "channel";
+}
+
+function asChannelKind(value) {
+  if (value === "channel" || value === "im" || value === "mpim" || value === "group") return value;
+  return channelKindFromInfo(value);
+}
+
+/**
+ * Public-channel gate.
+ * allowlistMode "unresolved" (live): HONCHO_CHANNEL_IDS applies only when type is missing.
+ * allowlistMode "all" (backfill): when the allowlist is set, only those ids are eligible.
+ * lookup(channelId) is used only when type is missing and no allowlist is set.
+ * It may return a kind string or a conversations.info channel object. null means unresolved.
+ */
+export async function resolveIngestChannel(event, opts = {}) {
+  const allowlist = opts.allowlist === undefined ? null : parseChannelIds(opts.allowlist);
+  const mode = opts.allowlistMode || "unresolved";
+  const sync = classifyChannelSync(event, { allowlist, allowlistMode: mode });
+  if (sync) return sync;
+  const channel = String(event?.channel || "");
+  const cache = opts.cache || lookupCache;
+  let kind = null;
+  if (opts.lookup && channel) {
+    if (cache.has(channel)) kind = cache.get(channel);
+    else {
+      try {
+        kind = asChannelKind(await opts.lookup(channel));
+      } catch {
+        kind = null;
+      }
+      cache.set(channel, kind);
+    }
+  }
+  if (kind === "im" || kind === "mpim" || kind === "group") return { ok: false, reason: "not-public" };
+  if (kind === "channel") return { ok: true, event: { ...event, channel_type: "channel" } };
+  return { ok: false, reason: "needs-channel-type" };
+}
+
+function classifyChannelSync(event, { allowlist, allowlistMode }) {
+  if (!event || typeof event !== "object") return { ok: false, reason: "no-event" };
+  const channel = String(event.channel || "");
+  const ct = event.channel_type;
+  if (ct === "im" || ct === "mpim" || ct === "group" || channel.startsWith("D")) {
+    return { ok: false, reason: "not-public" };
+  }
+  if (ct === "channel") {
+    if (allowlistMode === "all" && allowlist && !allowlist.has(channel)) {
+      return { ok: false, reason: "not-allowlisted" };
+    }
+    return { ok: true, event };
+  }
+  if (ct) return { ok: false, reason: "not-public" };
+  if (allowlist) {
+    if (allowlist.has(channel)) return { ok: true, event: { ...event, channel_type: "channel" } };
+    return { ok: false, reason: "not-allowlisted" };
+  }
+  return null;
+}
+
 export function isPublicChannel(event) {
-  const ct = event?.channel_type;
-  if (ct === "im" || ct === "mpim" || ct === "group") return false;
-  if (ct === "channel") return true;
-  if (ct) return false;
-  return String(event?.channel || "").startsWith("C");
+  return event?.channel_type === "channel";
 }
 
 export function sessionIdForChannel(channelId) {
@@ -298,8 +406,13 @@ export async function sendIngest(env, prepared, opts = {}) {
  * Otherwise a promise that logs failures and does not reject.
  * Callers must not await this on the Slack ack or wakeGrok path.
  */
-export function ingestIfEnabled(env, event, opts = {}) {
-  if (!honchoIngestEnabled(env)) return null;
+function logSkip(reason, event, opts) {
+  if (!LOUD_SKIP.has(reason)) return null;
+  (opts.log || console.log)("honcho skip", reason, event?.channel, event?.ts);
+  return null;
+}
+
+function startWrite(env, event, opts) {
   let decision;
   try {
     decision = decideIngest(event, opts);
@@ -308,10 +421,7 @@ export function ingestIfEnabled(env, event, opts = {}) {
     return null;
   }
   const logFn = opts.log || console.log;
-  if (!decision.ok) {
-    if (LOUD_SKIP.has(decision.reason)) logFn("honcho skip", decision.reason, event?.channel, event?.ts);
-    return null;
-  }
+  if (!decision.ok) return logSkip(decision.reason, event, opts);
   const state = stateOf(opts);
   if (!claim(state, decision.channel, decision.ts)) return null;
   return materialize(decision, opts)
@@ -322,5 +432,39 @@ export function ingestIfEnabled(env, event, opts = {}) {
     .catch((err) => {
       unclaim(state, decision.channel, decision.ts);
       logFn("honcho ingest failed", err?.message || err, decision.channel, decision.ts);
+    });
+}
+
+/**
+ * Returns null when ingest is off, filtered, or deduped.
+ * Otherwise a promise that logs failures and does not reject.
+ * Callers must not await this on the Slack ack or wakeGrok path.
+ * Channel type missing: HONCHO_CHANNEL_IDS, else opts.lookupChannel, else skip.
+ */
+export function ingestIfEnabled(env, event, opts = {}) {
+  if (!honchoIngestEnabled(env)) return null;
+  const allowlist = opts.allowlist !== undefined ? opts.allowlist : env?.HONCHO_CHANNEL_IDS;
+  let sync;
+  try {
+    sync = classifyChannelSync(event, {
+      allowlist: parseChannelIds(allowlist),
+      allowlistMode: opts.allowlistMode || "unresolved",
+    });
+  } catch (err) {
+    (opts.log || console.log)("honcho ingest failed", err?.message || err);
+    return null;
+  }
+  if (sync) return sync.ok ? startWrite(env, sync.event, opts) : logSkip(sync.reason, event, opts);
+  return resolveIngestChannel(event, { lookup: opts.lookupChannel })
+    .then((resolved) => {
+      if (!resolved.ok) {
+        const logFn = opts.log || console.log;
+        if (resolved.reason === "not-public") logFn("honcho skip", "not-public", event?.channel, event?.ts);
+        return logSkip(resolved.reason, event, opts);
+      }
+      return startWrite(env, resolved.event, opts);
+    })
+    .catch((err) => {
+      (opts.log || console.log)("honcho ingest failed", err?.message || err);
     });
 }

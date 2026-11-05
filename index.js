@@ -308,6 +308,15 @@ function honchoExtras(client, logger) {
       if (logger?.info) logger.info(...args);
       else console.log(...args);
     },
+    // null on missing_scope / error. A C id is not treated as public.
+    lookupChannel: async (channel) => {
+      try {
+        const info = await client.conversations.info({ channel });
+        return info?.channel || null;
+      } catch {
+        return null;
+      }
+    },
     resolveDisplay: async (userId) => {
       const info = await resolveUser(client, userId);
       return info?.display_name || info?.real_name || info?.name || null;

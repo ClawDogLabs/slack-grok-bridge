@@ -372,6 +372,56 @@ test("our own public reply is ingested and other bots are not", async () => {
   });
 });
 
+test("unresolved channel_type does not ingest unless HONCHO_CHANNEL_IDS lists it", async () => {
+  const calls = [];
+  await withMockFetch(async (url, opts = {}) => {
+    const u = String(url);
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    calls.push({ url: u, body });
+    if (u.includes("conversations.info")) {
+      if (u.includes("channel=C0MPIM")) return jsonResponse({ ok: true, channel: { id: "C0MPIM", is_mpim: true } });
+      return jsonResponse({ ok: false, error: "missing_scope" });
+    }
+    if (u.includes("users.info")) return jsonResponse({ ok: true, user: { id: "UHUMAN", name: "ada", profile: { display_name: "Ada" } } });
+    if (u.includes("reactions.add") || u.includes("assistant.threads")) return jsonResponse({ ok: true });
+    return new Response("{}", { status: 200 });
+  }, async () => {
+    resetHonchoState();
+    const env = { ...baseEnv, HONCHO_INGEST: "1", HONCHO_API_KEY: "hk-test", SLACK_BOT_TOKEN: "xoxb-test", GROK_WEBHOOK_URL: "https://example.test/hook" };
+    const mention = await post(
+      { type: "event_callback", event: { type: "app_mention", channel: "C0CF63G4CMA", user: "UHUMAN", text: `<@${ME}> hello from the lab`, ts: "1710000008.1" } },
+      { env },
+    );
+    await Promise.all(mention.waited);
+    await settleBackground();
+    assert.equal(calls.some((c) => c.url.includes("example.test/hook")), true);
+    assert.equal(calls.some((c) => c.url.includes("api.honcho.dev")), false);
+
+    calls.length = 0;
+    resetHonchoState();
+    const mpim = await post(
+      { type: "event_callback", event: { type: "app_mention", channel: "C0MPIM", user: "UHUMAN", text: `<@${ME}> hello from the lab`, ts: "1710000008.2" } },
+      { env },
+    );
+    await Promise.all(mpim.waited);
+    await settleBackground();
+    assert.equal(calls.some((c) => c.url.includes("api.honcho.dev")), false);
+
+    calls.length = 0;
+    resetHonchoState();
+    const allowed = await post(
+      { type: "event_callback", event: { type: "app_mention", channel: "CPUBLIC", user: "UHUMAN", text: `<@${ME}> hello from the lab`, ts: "1710000008.3" } },
+      { env: { ...env, HONCHO_CHANNEL_IDS: "CPUBLIC" } },
+    );
+    await Promise.all(allowed.waited);
+    await settleBackground();
+    const message = calls.find((c) => c.url.endsWith("/messages"));
+    assert.ok(message, "allowlisted mention was ingested");
+    assert.equal(message.body.messages[0].metadata.channel, "CPUBLIC");
+    assert.equal(message.body.messages[0].peer_id, "UHUMAN");
+  });
+});
+
 test("event responses are immediate and carry the routing decision", async () => {
   const { res } = await post({ type: "event_callback", event_id: "Ev1", event: { type: "message", channel_type: "channel", channel: "COTHER", user: "UHUMAN", text: "hello there" } });
   assert.equal(res.status, 200);
