@@ -2,6 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker, { route, cfg, dropRetry, slackSignature, ackEmoji, replyFields, postMessageArgs } from "../src/index.js";
+import { resetHonchoState } from "../src/honcho.js";
 
 const SECRET = "test-signing-secret";
 const ME = "UBOT0001";
@@ -104,6 +105,10 @@ test("ack emoji and reply placement", () => {
     { channel: "C1", text: "hi", thread_ts: "1.1", reply_broadcast: true },
   );
 });
+
+async function settleBackground() {
+  for (let i = 0; i < 40; i++) await Promise.resolve();
+}
 
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
@@ -212,6 +217,208 @@ test("opt-in text hold-ack follows the threading rule", async () => {
     assert.equal(posts[1].thread_ts, undefined);
     assert.equal(posts[1].reply_broadcast, undefined);
     assert.equal(calls.some((c) => c.url.includes("reactions.add")), false);
+  });
+});
+
+test("honcho ingest stays off unless HONCHO_INGEST is on", async () => {
+  const calls = [];
+  await withMockFetch(async (url) => {
+    calls.push(String(url));
+    return new Response("ok", { status: 200 });
+  }, async () => {
+    resetHonchoState();
+    const { res, waited } = await post(
+      { type: "event_callback", event: { type: "message", channel_type: "channel", channel: "COTHER", user: "UHUMAN", text: "hello from the lab", ts: "1710000000.5" } },
+      { env: { ...baseEnv, HONCHO_API_KEY: "hk-test", SLACK_BOT_TOKEN: "xoxb-test" } },
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("X-Relay-Action"), "ignore:not-watched");
+    assert.equal(waited.length, 0);
+    assert.equal(calls.some((u) => u.includes("honcho.dev")), false);
+  });
+});
+
+test("public channel ingest is waitUntil, does not wake Grok, and does not block the ack", async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const calls = [];
+  await withMockFetch(async (url, opts = {}) => {
+    const u = String(url);
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    calls.push({ url: u, body });
+    if (u.includes("api.honcho.dev")) {
+      await gate;
+      return new Response("{}", { status: 200 });
+    }
+    if (u.includes("users.info")) {
+      return jsonResponse({ ok: true, user: { id: "UHUMAN", name: "ada", profile: { display_name: "Ada" } } });
+    }
+    return new Response("ok", { status: 200 });
+  }, async () => {
+    resetHonchoState();
+    let waited = [];
+    try {
+      const posted = await post(
+        { type: "event_callback", event: { type: "message", channel_type: "channel", channel: "COTHER", user: "UHUMAN", text: "hello from the lab", ts: "1710000000.5" } },
+        { env: { ...baseEnv, HONCHO_INGEST: "1", HONCHO_API_KEY: "hk-test", SLACK_BOT_TOKEN: "xoxb-test", GROK_WEBHOOK_URL: "https://example.test/hook" } },
+      );
+      waited = posted.waited;
+      assert.equal(posted.res.status, 200);
+      assert.equal(posted.res.headers.get("X-Relay-Action"), "ignore:not-watched");
+      assert.equal(waited.length, 1);
+      await settleBackground();
+      assert.equal(calls.some((c) => c.url.includes("example.test/hook")), false);
+      assert.equal(calls.some((c) => c.url.includes("api.honcho.dev")), true);
+      release();
+      await Promise.all(waited);
+      const message = calls.find((c) => c.url.endsWith("/messages"));
+      assert.ok(message, "message was posted");
+      assert.equal(message.body.messages[0].content, "Ada: hello from the lab");
+      assert.equal(message.body.messages[0].metadata.slack_ts, "1710000000.5");
+      assert.equal(message.body.messages[0].peer_id, "UHUMAN");
+      assert.equal(calls.some((c) => c.url === "https://api.honcho.dev/v3/workspaces" && c.body.id === "princeton-ai-slack"), true);
+    } finally {
+      release();
+      await Promise.all(waited);
+    }
+  });
+});
+
+test("DMs and private channels are not ingested, and a watched wake is not blocked on Honcho", async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const calls = [];
+  await withMockFetch(async (url, opts = {}) => {
+    const u = String(url);
+    calls.push({ url: u, body: opts.body ? JSON.parse(opts.body) : null });
+    if (u.includes("api.honcho.dev")) {
+      await gate;
+      return new Response("{}", { status: 200 });
+    }
+    if (u.includes("users.info")) return jsonResponse({ ok: true, user: { id: "UHUMAN", name: "ada", profile: { display_name: "Ada" } } });
+    if (u.includes("reactions.add") || u.includes("assistant.threads")) return jsonResponse({ ok: true });
+    return new Response("ok", { status: 200 });
+  }, async () => {
+    resetHonchoState();
+    const env = { ...baseEnv, HONCHO_INGEST: "1", HONCHO_API_KEY: "hk-test", SLACK_BOT_TOKEN: "xoxb-test", GROK_WEBHOOK_URL: "https://example.test/hook", WATCH_CHANNEL_IDS: "CWATCH" };
+    let waited = [];
+    try {
+      const dm = await post(
+        { type: "event_callback", event: { type: "message", channel_type: "im", channel: "D1", user: "UHUMAN", text: "hello there", ts: "1710000001.1" } },
+        { env },
+      );
+      waited = dm.waited;
+      await Promise.all(dm.waited);
+      await settleBackground();
+      assert.equal(calls.some((c) => c.url.includes("api.honcho.dev")), false);
+      assert.equal(calls.some((c) => c.url.includes("example.test/hook")), true);
+
+      calls.length = 0;
+      const mpim = await post(
+        { type: "event_callback", event: { type: "message", channel_type: "mpim", channel: "G1", user: "UHUMAN", text: "hello there", ts: "1710000001.2" } },
+        { env },
+      );
+      waited = mpim.waited;
+      await Promise.all(mpim.waited);
+      await settleBackground();
+      assert.equal(calls.some((c) => c.url.includes("api.honcho.dev")), false);
+
+      calls.length = 0;
+      const watched = await post(
+        { type: "event_callback", event: { type: "message", channel_type: "channel", channel: "CWATCH", user: "UHUMAN", text: "please look at the experiment log today", ts: "1710000001.3" } },
+        { env },
+      );
+      waited = watched.waited;
+      assert.equal(watched.res.headers.get("X-Relay-Action"), "watched:watched-channel");
+      await settleBackground();
+      assert.equal(calls.some((c) => c.url.includes("example.test/hook")), true);
+      assert.equal(calls.some((c) => c.url.includes("api.honcho.dev")), true);
+      release();
+      await Promise.all(watched.waited);
+    } finally {
+      release();
+      await Promise.all(waited);
+    }
+  });
+});
+
+test("our own public reply is ingested and other bots are not", async () => {
+  const calls = [];
+  await withMockFetch(async (url, opts = {}) => {
+    const u = String(url);
+    calls.push({ url: u, body: opts.body ? JSON.parse(opts.body) : null });
+    if (u.includes("users.info")) return jsonResponse({ ok: true, user: { id: ME, name: "dinky", profile: { display_name: "Dinky" } } });
+    return new Response("{}", { status: 200 });
+  }, async () => {
+    resetHonchoState();
+    const env = { ...baseEnv, HONCHO_INGEST: "1", HONCHO_API_KEY: "hk-test", SLACK_BOT_TOKEN: "xoxb-test", GROK_WEBHOOK_URL: "https://example.test/hook" };
+    const other = await post(
+      { type: "event_callback", event: { type: "message", channel_type: "channel", channel: "COTHER", user: "UBOT9", bot_id: "BOTHER", text: "noise from another bot", ts: "1710000002.1" } },
+      { env },
+    );
+    await Promise.all(other.waited);
+    assert.equal(calls.some((c) => c.url.includes("api.honcho.dev")), false);
+
+    const own = await post(
+      { type: "event_callback", event: { type: "message", channel_type: "channel", channel: "COTHER", user: ME, bot_id: "BBOT0001", subtype: "bot_message", text: "shipped the summary", ts: "1710000002.2" } },
+      { env },
+    );
+    await Promise.all(own.waited);
+    const message = calls.find((c) => c.url.endsWith("/messages"));
+    assert.ok(message);
+    assert.equal(message.body.messages[0].content, "Dinky: shipped the summary");
+    assert.equal(message.body.messages[0].peer_id, ME);
+    assert.equal(calls.some((c) => c.url.includes("example.test/hook")), false);
+  });
+});
+
+test("unresolved channel_type does not ingest unless HONCHO_CHANNEL_IDS lists it", async () => {
+  const calls = [];
+  await withMockFetch(async (url, opts = {}) => {
+    const u = String(url);
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    calls.push({ url: u, body });
+    if (u.includes("conversations.info")) {
+      if (u.includes("channel=C0MPIM")) return jsonResponse({ ok: true, channel: { id: "C0MPIM", is_mpim: true } });
+      return jsonResponse({ ok: false, error: "missing_scope" });
+    }
+    if (u.includes("users.info")) return jsonResponse({ ok: true, user: { id: "UHUMAN", name: "ada", profile: { display_name: "Ada" } } });
+    if (u.includes("reactions.add") || u.includes("assistant.threads")) return jsonResponse({ ok: true });
+    return new Response("{}", { status: 200 });
+  }, async () => {
+    resetHonchoState();
+    const env = { ...baseEnv, HONCHO_INGEST: "1", HONCHO_API_KEY: "hk-test", SLACK_BOT_TOKEN: "xoxb-test", GROK_WEBHOOK_URL: "https://example.test/hook" };
+    const mention = await post(
+      { type: "event_callback", event: { type: "app_mention", channel: "C0CF63G4CMA", user: "UHUMAN", text: `<@${ME}> hello from the lab`, ts: "1710000008.1" } },
+      { env },
+    );
+    await Promise.all(mention.waited);
+    await settleBackground();
+    assert.equal(calls.some((c) => c.url.includes("example.test/hook")), true);
+    assert.equal(calls.some((c) => c.url.includes("api.honcho.dev")), false);
+
+    calls.length = 0;
+    resetHonchoState();
+    const mpim = await post(
+      { type: "event_callback", event: { type: "app_mention", channel: "C0MPIM", user: "UHUMAN", text: `<@${ME}> hello from the lab`, ts: "1710000008.2" } },
+      { env },
+    );
+    await Promise.all(mpim.waited);
+    await settleBackground();
+    assert.equal(calls.some((c) => c.url.includes("api.honcho.dev")), false);
+
+    calls.length = 0;
+    resetHonchoState();
+    const allowed = await post(
+      { type: "event_callback", event: { type: "app_mention", channel: "CPUBLIC", user: "UHUMAN", text: `<@${ME}> hello from the lab`, ts: "1710000008.3" } },
+      { env: { ...env, HONCHO_CHANNEL_IDS: "CPUBLIC" } },
+    );
+    await Promise.all(allowed.waited);
+    await settleBackground();
+    const message = calls.find((c) => c.url.endsWith("/messages"));
+    assert.ok(message, "allowlisted mention was ingested");
+    assert.equal(message.body.messages[0].metadata.channel, "CPUBLIC");
+    assert.equal(message.body.messages[0].peer_id, "UHUMAN");
   });
 });
 
