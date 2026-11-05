@@ -16,6 +16,10 @@ import {
   createHonchoState,
   sessionIdForChannel,
   buildPersonalRe,
+  resolveIngestChannel,
+  mapLogPeer,
+  botLabelSet,
+  resetHonchoState,
 } from "../src/honcho.js";
 import { backfillLogs } from "../../scripts/honcho-backfill.mjs";
 
@@ -49,7 +53,8 @@ test("kill switch defaults off", () => {
 
 test("public channels only", () => {
   assert.equal(isPublicChannel({ channel_type: "channel", channel: "C1" }), true);
-  assert.equal(isPublicChannel({ channel: "C1" }), true);
+  assert.equal(isPublicChannel({ channel: "C1" }), false);
+  assert.equal(isPublicChannel({ channel: "C0SYNTHMPIM" }), false);
   assert.equal(isPublicChannel({ channel_type: "im", channel: "D1" }), false);
   assert.equal(isPublicChannel({ channel_type: "mpim", channel: "G1" }), false);
   assert.equal(isPublicChannel({ channel_type: "group", channel: "G1" }), false);
@@ -59,7 +64,62 @@ test("public channels only", () => {
   assert.equal(decideIngest(pub({ channel_type: "im", channel: "D1" }), { personalRe }).reason, "not-public");
   assert.equal(decideIngest(pub({ channel_type: "mpim", channel: "G1" }), { personalRe }).reason, "not-public");
   assert.equal(decideIngest(pub({ channel_type: "group", channel: "G9" }), { personalRe }).reason, "not-public");
-  assert.equal(decideIngest({ type: "message", channel: "C9", user: "U1", text: "hello there", ts: "1710000000.1" }, { personalRe }).ok, true);
+  assert.equal(decideIngest({ type: "message", channel: "C0SYNTHMPIM", user: "U1", text: "hello there", ts: "1710000000.1" }, { personalRe }).reason, "not-public");
+});
+
+test("missing channel_type uses allowlist, then conversations.info, else needs-channel-type", async () => {
+  const text = "the readout looks stable";
+  const base = { type: "message", user: "U1", text, ts: "1710000000.2" };
+  const cache = new Map();
+  let lookups = 0;
+  const lookup = async (channel) => {
+    lookups += 1;
+    if (channel === "C0SYNTHMPIM") return { is_mpim: true };
+    if (channel === "C0SYNTHPRIV") return { is_private: true, is_group: true };
+    if (channel === "CPUB") return { is_channel: true };
+    return null;
+  };
+  const mpim = await resolveIngestChannel({ ...base, channel: "C0SYNTHMPIM" }, { lookup, cache });
+  const priv = await resolveIngestChannel({ ...base, channel: "C0SYNTHPRIV" }, { lookup, cache });
+  const pubCh = await resolveIngestChannel({ ...base, channel: "CPUB" }, { lookup, cache });
+  const again = await resolveIngestChannel({ ...base, channel: "CPUB", ts: "1710000000.3" }, { lookup, cache });
+  assert.equal(mpim.reason, "not-public");
+  assert.equal(priv.reason, "not-public");
+  assert.equal(pubCh.ok, true);
+  assert.equal(pubCh.event.channel_type, "channel");
+  assert.equal(again.ok, true);
+  assert.equal(lookups, 3);
+
+  const failed = await resolveIngestChannel(
+    { ...base, channel: "C0SYNTHMPIM", ts: "1710000000.4" },
+    { lookup: async () => null, cache: new Map() },
+  );
+  assert.equal(failed.reason, "needs-channel-type");
+
+  let allowLookups = 0;
+  const listed = await resolveIngestChannel(
+    { ...base, channel: "CPUB" },
+    { allowlist: "CPUB,COTHER", lookup: async () => { allowLookups += 1; return { is_mpim: true }; } },
+  );
+  const blocked = await resolveIngestChannel(
+    { ...base, channel: "C0SYNTHMPIM" },
+    { allowlist: "CPUB" },
+  );
+  assert.equal(listed.ok, true);
+  assert.equal(allowLookups, 0);
+  assert.equal(blocked.reason, "not-allowlisted");
+});
+
+test("log label samplebot maps to OWN_USER_ID and is never the peer id", () => {
+  const labels = botLabelSet("Samplebot");
+  const mapped = mapLogPeer("samplebot", { ownUserId: "UBOTSAMPLE", labels });
+  assert.equal(mapped.peerId, "UBOTSAMPLE");
+  assert.notEqual(mapped.peerId, "samplebot");
+  assert.equal(mapLogPeer("Samplebot", { ownUserId: "UBOTSAMPLE", labels }).peerId, "UBOTSAMPLE");
+  assert.equal(mapLogPeer("@samplebot", { ownUserId: "UBOTSAMPLE", labels }).peerId, "UBOTSAMPLE");
+  assert.equal(mapLogPeer("samplebot", { ownUserId: "", labels }).peerId, null);
+  assert.equal(mapLogPeer("UHUMAN1", { ownUserId: "UBOTSAMPLE", labels }).peerId, "UHUMAN1");
+  assert.equal(mapLogPeer("not-a-label", { ownUserId: "UBOTSAMPLE", labels }).peerId, null);
 });
 
 test("privacy filter drops personal text, tokens, key urls, addresses, and finances", () => {
@@ -224,6 +284,80 @@ test("backfill replays public lines in ts order and dry-run does not POST", asyn
   assert.equal(wrote.wrote, 2);
   assert.equal(posted.some((u) => u.endsWith("/messages")), true);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+function slackJson(obj) {
+  return new Response(JSON.stringify(obj), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+test("backfill does not treat bare C ids as public and maps samplebot to OWN_USER_ID", async () => {
+  const entries = [
+    { channel: "C0SYNTHMPIM", ts: "1710000001.1", user: "U1", text: "group dm note" },
+    { channel: "C0SYNTHPRIV", ts: "1710000001.2", user: "U1", text: "private note" },
+    { channel: "CPUB", ts: "1710000001.3", user: "samplebot", text: "shipped the notes" },
+    { channel: "CPUB", ts: "1710000001.4", user: "U2", text: "human note" },
+    { channel: "C0SYNTHMPIM", ts: "1710000001.5", user: "U2", text: "same mpim again" },
+    { channel: "CUNKNOWN", ts: "1710000001.6", user: "not-a-label", text: "name is not an id" },
+  ];
+  const info = {
+    C0SYNTHMPIM: { is_mpim: true },
+    C0SYNTHPRIV: { is_private: true, is_group: true },
+    CPUB: { is_channel: true },
+  };
+  let infoCalls = 0;
+  const fetchImpl = async (url) => {
+    const u = String(url);
+    if (u.includes("conversations.info")) {
+      infoCalls += 1;
+      const channel = new URL(u).searchParams.get("channel");
+      const channelObj = info[channel];
+      if (!channelObj) return slackJson({ ok: false, error: "missing_scope" });
+      return slackJson({ ok: true, channel: channelObj });
+    }
+    return slackJson({ ok: true });
+  };
+  const classified = await backfillLogs({
+    entries,
+    env: { SLACK_BOT_TOKEN: "xoxb-test", OWN_USER_ID: "UBOTSAMPLE", HONCHO_INGEST: "0" },
+    fetchImpl,
+  });
+  assert.equal(classified.dryRun, true);
+  assert.deepEqual(classified.accepted.map((row) => row.peerId), ["UBOTSAMPLE", "U2"]);
+  assert.equal(classified.accepted.every((row) => row.peerId !== "samplebot"), true);
+  assert.equal(classified.accepted[0].content, "samplebot: shipped the notes");
+  assert.equal(classified.accepted[0].channel, "CPUB");
+  assert.equal(classified.skipped["not-public"], 3);
+  assert.equal(classified.skipped["needs-channel-type"], 1);
+  assert.equal(infoCalls, 4);
+
+  let slackCalls = 0;
+  const allowlisted = await backfillLogs({
+    entries,
+    env: { HONCHO_CHANNEL_IDS: "CPUB", OWN_USER_ID: "UBOTSAMPLE", HONCHO_INGEST: "0", SLACK_BOT_TOKEN: "xoxb-test" },
+    fetchImpl: async (url) => {
+      if (String(url).includes("slack.com")) slackCalls += 1;
+      return slackJson({ ok: false, error: "missing_scope" });
+    },
+  });
+  assert.equal(slackCalls, 0);
+  assert.deepEqual(allowlisted.accepted.map((row) => [row.channel, row.peerId]), [
+    ["CPUB", "UBOTSAMPLE"],
+    ["CPUB", "U2"],
+  ]);
+  assert.ok(allowlisted.skipped["not-allowlisted"] >= 3);
+
+  const viaAuth = await backfillLogs({
+    entries: [{ channel: "CPUB", channel_type: "channel", ts: "1710000002.1", user: "Samplebot", text: "auth mapped reply" }],
+    env: { SLACK_BOT_TOKEN: "xoxb-test", BOT_NAME: "Samplebot", HONCHO_INGEST: "0" },
+    fetchImpl: async (url) => {
+      if (String(url).includes("auth.test")) return slackJson({ ok: true, user_id: "UBOTAUTH", user: "samplebot", bot_id: "BBOT" });
+      return slackJson({ ok: false, error: "missing_scope" });
+    },
+  });
+  assert.equal(viaAuth.accepted.length, 1);
+  assert.equal(viaAuth.accepted[0].peerId, "UBOTAUTH");
+  assert.notEqual(viaAuth.accepted[0].peerId, "samplebot");
+  assert.notEqual(viaAuth.accepted[0].peerId, "Samplebot");
 });
 
 test("socket and worker wire ingest off the wake path", () => {

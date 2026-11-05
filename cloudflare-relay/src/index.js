@@ -223,7 +223,10 @@ async function slackApi(env, method, body, { get = false, quiet = false } = {}) 
 const channelKindCache = new Map();
 let loggedChannelScope = false;
 
-/** Fill in channel_type when the event omitted it (app_mention does). Failures are not cached. */
+/**
+ * Wake-path classifier. Still fail-open ("channel") when conversations.info
+ * cannot tell. Honcho ingest must not use this result: see lookupIngestChannel.
+ */
 async function resolveChannelType(env, e) {
   const ct = e?.channel_type;
   if (ct === "im" || ct === "mpim" || ct === "channel" || ct === "group") return ct;
@@ -392,15 +395,34 @@ async function welcome(env, c, e) {
   log("welcomed", e.channel, e.user);
 }
 
+let loggedHonchoScope = false;
+
+// Ingest-only lookup. null means unresolved (missing_scope, no token, error).
+// Does not fail open to "channel". Cached by ingestIfEnabled.
+async function lookupIngestChannel(env, channel) {
+  if (!channel || !env.SLACK_BOT_TOKEN) return null;
+  const info = await slackApi(env, "conversations.info", { channel }, { get: true, quiet: true }).catch(() => null);
+  if (!info?.ok || !info.channel) {
+    if (info?.error === "missing_scope" && !loggedHonchoScope) {
+      loggedHonchoScope = true;
+      log("honcho conversations.info missing_scope; set HONCHO_CHANNEL_IDS until channels:read is granted");
+    }
+    return null;
+  }
+  return info.channel;
+}
+
 // Separate from wake. Runs for public messages route() ignores (the usual case
 // outside WATCH_CHANNEL_IDS) and for our own bot replies in public channels.
 // Returns null when HONCHO_INGEST is off. Caller must only waitUntil the promise.
+// Missing channel_type: HONCHO_CHANNEL_IDS, else conversations.info, else skip.
 function scheduleHoncho(env, c, e) {
   return ingestIfEnabled(env, e, {
     ownUserId: c.ownUserId,
     ownBotId: c.ownBotId,
     personalRe: c.personalRe,
     log: (...a) => log(...a),
+    lookupChannel: (channel) => lookupIngestChannel(env, channel),
     resolveDisplay: async (userId) => {
       const u = await resolveUser(env, userId);
       return u?.display_name || u?.real_name || u?.name || null;

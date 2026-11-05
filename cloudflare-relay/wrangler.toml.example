@@ -38,6 +38,9 @@ RETRY_POLICY = "drop_timeouts"        # drop_timeouts | drop_all | process_all (
 # DMs, group DMs, and private channels are not written. This does not read Honcho.
 HONCHO_INGEST = "0"
 HONCHO_WORKSPACE_ID = "slack-workspace"
+# Public channel ids used when channel_type is missing and conversations.info
+# cannot classify (no channels:read). Empty = fail closed. Not a secret.
+HONCHO_CHANNEL_IDS = ""
 
 # Secrets (set with `npx wrangler secret put NAME`, never in this file):
 #   SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, GROK_WEBHOOK_URL, GROK_WEBHOOK_SECRET,
