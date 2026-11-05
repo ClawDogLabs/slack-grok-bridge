@@ -109,6 +109,8 @@ works on Node 18/20. Wrangler v4 needs Node 20+ (or newer, check its release not
    printf '%s' "$GROK_WEBHOOK_URL"     | npx wrangler secret put GROK_WEBHOOK_URL
    printf '%s' "$GROK_WEBHOOK_SECRET"  | npx wrangler secret put GROK_WEBHOOK_SECRET
    printf '%s' "$SLACK_SIGNING_SECRET" | npx wrangler secret put SLACK_SIGNING_SECRET
+   # Only after you intend to ingest. Leave HONCHO_INGEST = "0" until then.
+   # printf '%s' "$HONCHO_API_KEY"    | npx wrangler secret put HONCHO_API_KEY
    ```
    The signing secret is under api.slack.com → your app → **Basic Information → App Credentials →
    Signing Secret**. The bot token needs `reactions:write` for the ack emoji, and `files:write`
@@ -135,6 +137,17 @@ In [api.slack.com/apps](https://api.slack.com/apps) → your app:
    `apps.connections.open`.
 5. Test: DM the bot, and @mention it in a channel it's in, while watching
    `npx wrangler tail slack-grok-relay`.
+
+## Honcho ingest (off by default)
+
+`HONCHO_INGEST` in `[vars]` defaults to `"0"`. Public-channel writes run inside `ctx.waitUntil` after the Worker has already built the `200` response. `wakeGrok` does not call Honcho. There is no read path.
+
+1. Keep `HONCHO_INGEST` at `"0"` and deploy.
+2. In Slack, **Event Subscriptions → Subscribe to bot events**, add `message.channels` if it is not already there. Save. Reinstall only if Slack asks. Do not add `message.groups` for this phase (private channels are filtered out). The bot must already be in the channel. `channels:history` is the matching scope (already on the sample manifest).
+3. Dry-run history: `node --env-file=.env scripts/honcho-backfill.mjs --dry-run` from the repo root. `--write` posts. The script does not use the Worker.
+4. `npx wrangler secret put HONCHO_API_KEY`, confirm `HONCHO_WORKSPACE_ID` (`princeton-ai-slack` if unset), then set `HONCHO_INGEST = "1"` and deploy again.
+5. Watch `npx wrangler tail` for `honcho ok` / `honcho skip`. A DM must not produce a Honcho post.
+6. Rollback: set `HONCHO_INGEST` back to `"0"` (or delete the var) and deploy. Ingest becomes a no-op. Already stored Honcho messages are left as-is.
 
 ## Redeploy / rollback
 
