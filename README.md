@@ -151,6 +151,25 @@ Patterns for the routine, not extra bridge code:
 
 `log/`, the live status file, and a live `REFERENCE_HISTORY.md` are gitignored.
 
+## Honcho memory ingest (off by default)
+
+Phase A writes public-channel Slack messages to [Honcho](https://honcho.dev) after the Slack ack. It does not read Honcho, and it does not run on the Grok wake path.
+
+`HONCHO_INGEST` defaults off (`0` / unset / `false`). Set it to `1` only after the checklist in the relay README. `HONCHO_API_KEY` is a secret (wrangler secret or `.env`, never committed). `HONCHO_WORKSPACE_ID` defaults to `slack-workspace`.
+
+Scope is public channels (`channel_type` `channel`, or a channel id starting with `C` when type is missing). DMs (`im`), group DMs (`mpim`), and private channels (`group`) are dropped. The same personal-term hold as `looksPersonal()` / the owner share policy drops family, schedule, address, phone, and email text. Tokens, key URLs, street addresses, and financial account numbers are dropped too. Empty and bot-noise subtypes are skipped. The bot's own public-channel replies are kept.
+
+Ordinary public messages do not wake Grok. The Worker schedules ingest with `ctx.waitUntil`. Socket Mode fires a void promise from `processInbound` and from the `message` listener. Neither awaits Honcho.
+
+Backfill replays `log/raw/*.jsonl` without the Worker. Default is dry-run:
+
+```bash
+node --env-file=.env scripts/honcho-backfill.mjs --dry-run
+node --env-file=.env scripts/honcho-backfill.mjs --write
+```
+
+Slack will not deliver ordinary public messages until the app subscribes to the `message.channels` bot event. That is a manual step in the Slack app UI. This repo does not change Event Subscriptions. Mentions still arrive via `app_mention` without that subscription. The bot has to be in the channel.
+
 ## Voice replies
 
 [`voice/`](voice/README.md) transcribes Slack audio locally (faster-whisper) and uploads a spoken reply (edge-tts, no API key). Configurable voice, rate, pitch, text file, comment, and a title taken from the clip topic. Needs `ffmpeg` on `PATH`, plus Slack `files:read` and `files:write`.
