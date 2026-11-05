@@ -27,6 +27,10 @@ Same routing and headers as the bridge. The webhook body adds a `reply` object; 
 - `app_mention` (human, or a bot in `ALLOW_BOT_IDS` / `ALLOW_BOT_USER_IDS`) → reaction ack →
   thinking status → webhook `kind: "app_mention"`. On webhook failure it posts
   "Could not reach Grok webhook…" using the threading rule below.
+  An allow-listed bot is ignored once it has posted more than `BOT_REPLY_CAP` messages
+  in that thread (default 3), so two bots cannot reply to each other forever.
+  Humans are never capped, and a top-level bot message is always allowed.
+  If the thread cannot be read, the bot mention is ignored.
 - `message` in a DM (`im`) or group DM (`mpim`) → reaction ack → webhook `kind: "message"`.
   An explicit @mention in a group DM is handled once, via `app_mention`.
 - The reaction emoji is `ACK_REACTION` (default `white_check_mark`). A missing custom emoji
@@ -60,6 +64,8 @@ Webhook request (identical to the bridge):
 | `HOLD_ACK_BROADCAST` | When the text hold-ack is on, also send it to the channel (default true). DMs are never broadcast. |
 | `HOLD_ACK_SKIP_REGEX` | Asks matching this regex get no text hold-ack (e.g. off-topic questions your routine will politely decline). |
 | `WELCOME_CHANNEL_IDS`, `WELCOME_TEXT`, `ASK_CHANNEL_ID` | New human joiners get a :wave: reaction and `WELCOME_TEXT` (`{user}`, `{ask_channel}` placeholders). Needs `reactions:write`. |
+| `ALLOW_BOT_IDS`, `ALLOW_BOT_USER_IDS` | Other bots allowed to @mention this bot (`B…` and/or bot user `U…`, comma-separated). Empty ignores every bot mention. This bot's own id is always ignored. |
+| `BOT_REPLY_CAP` | After an allow-listed bot has posted more than this many messages in a thread (default `3`), later @mentions from that bot in the thread are ignored. Humans are never capped. A top-level bot message (no `thread_ts`) is always allowed. The count is that bot's messages in `conversations.replies` (limit 200). If the call fails or the thread cannot be read, the relay ignores the bot mention (fail closed). `conversations.replies` needs a history scope for the conversation type. The manifest already includes `channels:history`, `groups:history`, and `im:history`, so public channels, private channels, and DMs need no new scope. Group DMs need `mpim:history`, which is not in the manifest; without it the relay fails closed for bot mentions in group-DM threads. Add that scope and reinstall only if the cap should count messages there. |
 | `BOT_NAME`, `MPIM_REQUIRE_ADDRESS` | With `MPIM_REQUIRE_ADDRESS="true"`, group DMs only wake the bot when it's @mentioned or `BOT_NAME` appears. |
 | `RETRY_POLICY` | See below. |
 

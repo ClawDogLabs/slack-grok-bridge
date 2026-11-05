@@ -19,6 +19,13 @@ OWNER_DISPLAY_NAME = ""               # used in hold-ack / thinking text ("the o
 PERSONAL_NAMES = ""                   # comma-separated names that trigger the stronger privacy hold-ack
 ALLOW_BOT_IDS = ""                    # other bots allowed to @mention this bot (B...), comma-separated
 ALLOW_BOT_USER_IDS = ""               # same, by bot user id (U...)
+BOT_REPLY_CAP = "3"                   # ignore an allow-listed bot after it has posted more than this
+                                      # many messages in one thread. Humans are never capped; a top-level
+                                      # bot message is always allowed. If the thread can't be read, further
+                                      # bot mentions there are ignored. conversations.replies uses history
+                                      # scopes the app already has (channels:history, groups:history,
+                                      # im:history). Add mpim:history to the manifest only for group DMs;
+                                      # without it those bot threads fail closed.
 
 # Optional. Leave empty to have the Worker look these up once with auth.test.
 OWN_USER_ID = ""                      # this bot's user id (U...)
