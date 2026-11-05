@@ -151,6 +151,27 @@ Patterns for the routine, not extra bridge code:
 
 `log/`, the live status file, and a live `REFERENCE_HISTORY.md` are gitignored.
 
+## Honcho memory ingest (off by default)
+
+Phase A writes public-channel Slack messages to [Honcho](https://honcho.dev) after the Slack ack. It does not read Honcho, and it does not run on the Grok wake path.
+
+`HONCHO_INGEST` defaults off (`0` / unset / `false`). Set it to `1` only after the checklist in the relay README. `HONCHO_API_KEY` is a secret (wrangler secret or `.env`, never committed). `HONCHO_WORKSPACE_ID` defaults to `slack-workspace`.
+
+Scope is public channels (`channel_type` `channel`). DMs (`im`), group DMs (`mpim`), and private channels (`group`) are dropped. A channel id that starts with `C` is not enough: group DMs can use those ids too. When `channel_type` is missing, `HONCHO_CHANNEL_IDS` (comma-separated public channel ids) is the allowlist. Otherwise a working `conversations.info` lookup is used. If that call cannot classify (`missing_scope` until `channels:read` is granted), the row is skipped. The same personal-term hold as `looksPersonal()` / the owner share policy drops family, schedule, address, phone, and email text. Tokens, key URLs, street addresses, and financial account numbers are dropped too. Empty and bot-noise subtypes are skipped. The bot's own public-channel replies are kept. Log label `samplebot` is stored under `OWN_USER_ID`, never as the peer id `samplebot`.
+
+Ordinary public messages do not wake Grok. The Worker schedules ingest with `ctx.waitUntil`. Socket Mode fires a void promise from `processInbound` and from the `message` listener. Neither awaits Honcho.
+
+Backfill replays `log/raw/*.jsonl` without the Worker. Default is dry-run. Log rows usually have no `channel_type`, so name the public channels (the production token has no `channels:read`, so `conversations.info` fails closed):
+
+```bash
+node --env-file=.env scripts/honcho-backfill.mjs --dry-run --channel-ids C0123,C0456
+node --env-file=.env scripts/honcho-backfill.mjs --write --channel-ids C0123,C0456
+```
+
+`HONCHO_CHANNEL_IDS` is the same list for the live bridge when an event has no `channel_type` (typical of `app_mention`). `--channel-ids` overrides it for one backfill run. Without a list and without a working `conversations.info`, those rows are skipped (`needs-channel-type`).
+
+Slack will not deliver ordinary public messages until the app subscribes to the `message.channels` bot event. That is a manual step in the Slack app UI. This repo does not change Event Subscriptions. Mentions still arrive via `app_mention` without that subscription. The bot has to be in the channel.
+
 ## Voice replies
 
 [`voice/`](voice/README.md) transcribes Slack audio locally (faster-whisper) and uploads a spoken reply (edge-tts, no API key). Configurable voice, rate, pitch, text file, comment, and a title taken from the clip topic. Needs `ffmpeg` on `PATH`, plus Slack `files:read` and `files:write`.

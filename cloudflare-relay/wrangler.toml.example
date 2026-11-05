@@ -34,5 +34,14 @@ ASK_CHANNEL_ID = ""                   # channel referenced as {ask_channel} in W
 WELCOME_TEXT = ""                     # placeholders {user} and {ask_channel}; a generic default is used if empty
 RETRY_POLICY = "drop_timeouts"        # drop_timeouts | drop_all | process_all (see README)
 
+# Honcho phase A. Default off. "1" writes public-channel messages after the Slack ack.
+# DMs, group DMs, and private channels are not written. This does not read Honcho.
+HONCHO_INGEST = "0"
+HONCHO_WORKSPACE_ID = "slack-workspace"
+# Public channel ids used when channel_type is missing and conversations.info
+# cannot classify (no channels:read). Empty = fail closed. Not a secret.
+HONCHO_CHANNEL_IDS = ""
+
 # Secrets (set with `npx wrangler secret put NAME`, never in this file):
-#   SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, GROK_WEBHOOK_URL, GROK_WEBHOOK_SECRET
+#   SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, GROK_WEBHOOK_URL, GROK_WEBHOOK_SECRET,
+#   HONCHO_API_KEY   (only needed when HONCHO_INGEST is "1")
