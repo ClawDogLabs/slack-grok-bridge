@@ -44,7 +44,10 @@ Same routing and headers as the bridge. The webhook body adds a `reply` object; 
   (`channels:read`, `groups:read`, `im:read`, or `mpim:read`). If that call fails, the
   mention is treated as a channel.
 - Bots (including itself), edits, deletes and other subtypes are ignored, except `file_share`
-  (a user posting an image or PDF), which is forwarded with a `files` array.
+  (a user posting an image or PDF) and `slack_audio` (a voice clip). Both are forwarded
+  with a `files` array when Slack includes one. A file whose mimetype starts with `audio/`,
+  is `video/mp4`, or whose filetype is `m4a`, `mp3`, `webm`, `ogg`, `wav`, `mp4`, or `aac`
+  counts as audio even when the subtype is missing.
 - Every event response carries a debug header `X-Relay-Action: <action>:<reason>`.
 - `GET /health` → `{"ok":true,"configured":true}` once the required secrets exist.
 
@@ -58,7 +61,7 @@ Webhook request (identical to the bridge):
 
 | Var | Effect |
 |-----|--------|
-| `WATCH_CHANNEL_IDS` | Forward messages in these channels **without** an @mention, as `{ kind: "channel_message", watched: true, slack, reply }` (no thinking, reaction, or hold-ack). A cheap pre-filter skips short chatter: forwarded only if it has `BOT_NAME`, a `?`, or more than 4 words. Your routine must decide whether to answer. |
+| `WATCH_CHANNEL_IDS` | Forward messages in these channels **without** an @mention, as `{ kind: "channel_message", watched: true, slack, reply }` (no thinking or hold-ack). A cheap pre-filter skips short chatter: forwarded only if it has `BOT_NAME`, a `?`, or more than 4 words. Audio skips that filter, including an empty caption (`watched-audio`). After a successful audio wake the Worker adds `ACK_REACTION` on that message. Other watched forwards do not react. Your routine must decide whether to answer. |
 | `ACK_REACTION` | Emoji name without colons (default `white_check_mark`). `off` disables the reaction. A missing custom emoji falls back to `white_check_mark`. Missing `reactions:write` is logged. |
 | `HOLD_ACK` | `"true"` also posts the text hold-ack. Default off, so a new deploy does not double-ack. |
 | `HOLD_ACK_BROADCAST` | When the text hold-ack is on, also send it to the channel (default true). DMs are never broadcast. |
@@ -66,10 +69,10 @@ Webhook request (identical to the bridge):
 | `WELCOME_CHANNEL_IDS`, `WELCOME_TEXT`, `ASK_CHANNEL_ID` | New human joiners get a :wave: reaction and `WELCOME_TEXT` (`{user}`, `{ask_channel}` placeholders). Needs `reactions:write`. |
 | `ALLOW_BOT_IDS`, `ALLOW_BOT_USER_IDS` | Other bots allowed to @mention this bot (`B…` and/or bot user `U…`, comma-separated). Empty ignores every bot mention. This bot's own id is always ignored. |
 | `BOT_REPLY_CAP` | After an allow-listed bot has posted more than this many messages in a thread (default `3`), later @mentions from that bot in the thread are ignored. Humans are never capped. A top-level bot message (no `thread_ts`) is always allowed. The count is that bot's messages in `conversations.replies` (limit 200). If the call fails or the thread cannot be read, the relay ignores the bot mention (fail closed). `conversations.replies` needs a history scope for the conversation type. The manifest already includes `channels:history`, `groups:history`, and `im:history`, so public channels, private channels, and DMs need no new scope. Group DMs need `mpim:history`, which is not in the manifest; without it the relay fails closed for bot mentions in group-DM threads. Add that scope and reinstall only if the cap should count messages there. |
-| `BOT_NAME`, `MPIM_REQUIRE_ADDRESS` | With `MPIM_REQUIRE_ADDRESS="true"`, group DMs only wake the bot when it's @mentioned or `BOT_NAME` appears. |
+| `BOT_NAME`, `MPIM_REQUIRE_ADDRESS` | With `MPIM_REQUIRE_ADDRESS="true"`, group DMs only wake the bot when it's @mentioned, `BOT_NAME` appears, or the message is audio. |
 | `RETRY_POLICY` | See below. |
 
-`HOLD_ACK_DM_TOP_LEVEL` is no longer read. DM and group-DM placement follows the threading rule above. `ACK_REACTION` defaults on and `HOLD_ACK` defaults off. Watched-channel forwards still do not react or post a hold-ack. The other rows stay off until you set them.
+`HOLD_ACK_DM_TOP_LEVEL` is no longer read. DM and group-DM placement follows the threading rule above. `ACK_REACTION` defaults on and `HOLD_ACK` defaults off. Watched-channel text forwards still do not react or post a hold-ack. A watched voice clip gets `ACK_REACTION` only after the webhook succeeds. The other rows stay off until you set them.
 
 ### Slack retries and Delayed Events
 
@@ -115,6 +118,8 @@ works on Node 18/20. Wrangler v4 needs Node 20+ (or newer, check its release not
    printf '%s' "$GROK_WEBHOOK_URL"     | npx wrangler secret put GROK_WEBHOOK_URL
    printf '%s' "$GROK_WEBHOOK_SECRET"  | npx wrangler secret put GROK_WEBHOOK_SECRET
    printf '%s' "$SLACK_SIGNING_SECRET" | npx wrangler secret put SLACK_SIGNING_SECRET
+   # Only after you intend to ingest. Leave HONCHO_INGEST = "0" until then.
+   # printf '%s' "$HONCHO_API_KEY"    | npx wrangler secret put HONCHO_API_KEY
    ```
    The signing secret is under api.slack.com → your app → **Basic Information → App Credentials →
    Signing Secret**. The bot token needs `reactions:write` for the ack emoji, and `files:write`
@@ -141,6 +146,27 @@ In [api.slack.com/apps](https://api.slack.com/apps) → your app:
    `apps.connections.open`.
 5. Test: DM the bot, and @mention it in a channel it's in, while watching
    `npx wrangler tail slack-bridge-example`.
+
+## Honcho ingest (off by default)
+
+`HONCHO_INGEST` in `[vars]` defaults to `"0"`. Public-channel writes run inside `ctx.waitUntil` after the Worker has already built the `200` response. `wakeGrok` does not call Honcho. Ingest itself does not read.
+
+### Optional wake-path reads (off by default)
+
+`HONCHO_READ` is independent of `HONCHO_INGEST` and defaults to `"0"`. When it is `"1"`, `processInbound` and `forwardWatched` GET the per-channel session (`channel-<id>`) and attach the result as `payload.honcho` before `wakeGrok`. `HONCHO_READ_TIMEOUT_MS` defaults to `1500` and is capped at `15000`. A missing key, HTTP error, or timeout still wakes Grok with `honcho.ok === false`. The read runs in `ctx.waitUntil`, so the Slack `200` is not delayed. Socket Mode stays write-only; this read hook is on the Worker module, which `node-http-relay` imports.
+
+`HONCHO_API_KEY` is required for ingest and for reads. Set it with `npx wrangler secret put`, not in `wrangler.toml`.
+
+`HONCHO_CHANNEL_IDS` is optional. Set it to comma-separated public channel ids. The current bot token gets `missing_scope` from `conversations.info` (no `channels:read`). Events that already include `channel_type: channel` still ingest. `app_mention` often has no type: those are ingested only when the channel id is in `HONCHO_CHANNEL_IDS`, or when `conversations.info` succeeds and says the channel is public. A failed lookup does not treat a `C` id as public, so a group-DM mention is not written. Wake routing is unchanged.
+
+1. Keep `HONCHO_INGEST` at `"0"` and deploy.
+2. In Slack, **Event Subscriptions → Subscribe to bot events**, add `message.channels` if it is not already there. Save. Reinstall only if Slack asks. Do not add `message.groups` for this phase (private channels are filtered out). The bot must already be in the channel. `channels:history` is the matching scope (already on the sample manifest).
+3. Dry-run history from the repo root. Pass the public channel ids, because log rows have no `channel_type` and `conversations.info` fails closed without `channels:read`:
+   `node --env-file=.env scripts/honcho-backfill.mjs --dry-run --channel-ids C0123,C0456`
+   `--write` posts. The script does not use the Worker. `samplebot` in the log is written as `OWN_USER_ID` (or `auth.test` `user_id`), not the string `samplebot`.
+4. `npx wrangler secret put HONCHO_API_KEY`, confirm `HONCHO_WORKSPACE_ID` (`slack-workspace` if unset), then set `HONCHO_INGEST = "1"` and deploy again.
+5. Watch `npx wrangler tail` for `honcho ok` / `honcho skip`. A DM must not produce a Honcho post.
+6. Rollback: set `HONCHO_INGEST` back to `"0"` (or delete the var) and deploy. Ingest becomes a no-op. Already stored Honcho messages are left as-is.
 
 ## Redeploy / rollback
 

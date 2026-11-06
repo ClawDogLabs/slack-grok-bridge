@@ -11,7 +11,9 @@
  *           HOLD_ACK_BROADCAST (default "true"), OWNER_DISPLAY_NAME (default "the owner"),
  *           ALLOW_BOT_IDS / ALLOW_BOT_USER_IDS (comma-separated; empty = ignore bot mentions),
  *           CLIENT_PING_TIMEOUT_MS (default 15000), SERVER_PING_TIMEOUT_MS (default 60000),
- *           WATCHDOG_MAX_UNHEALTHY_MS (default 120000)
+ *           WATCHDOG_MAX_UNHEALTHY_MS (default 120000),
+ *           HONCHO_INGEST (default off; "1" writes public-channel messages to Honcho),
+ *           HONCHO_API_KEY, HONCHO_WORKSPACE_ID (default slack-workspace)
  *
  * Reliability: Socket Mode only works while this process is running AND its host is awake.
  * A connection watchdog exits(1) when the socket stays unhealthy, so supervise.sh (started by
@@ -290,6 +292,51 @@ function looksPersonal(text) {
   return PERSONAL_RE.test(String(text || ""));
 }
 
+// Same rule as cloudflare-relay/src/honcho.js honchoIngestEnabled. Default off.
+function honchoIngestOn() {
+  const v = String(process.env.HONCHO_INGEST ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function honchoExtras(client, logger) {
+  return {
+    logger,
+    ownUserId,
+    ownBotId,
+    personalRe: PERSONAL_RE,
+    log: (...args) => {
+      if (logger?.info) logger.info(...args);
+      else console.log(...args);
+    },
+    // null on missing_scope / error. A C id is not treated as public.
+    lookupChannel: async (channel) => {
+      try {
+        const info = await client.conversations.info({ channel });
+        return info?.channel || null;
+      } catch {
+        return null;
+      }
+    },
+    resolveDisplay: async (userId) => {
+      const info = await resolveUser(client, userId);
+      return info?.display_name || info?.real_name || info?.name || null;
+    },
+  };
+}
+
+// Fire-and-forget. Never await this before the Bolt listener returns or inside wakeGrok.
+function fireHonchoIngest(event, extras = {}) {
+  if (!honchoIngestOn()) return;
+  const logger = extras.logger;
+  void import("./cloudflare-relay/src/honcho.js")
+    .then((m) => m.ingestIfEnabled(process.env, event, extras))
+    .catch((err) => {
+      const msg = err?.message || err;
+      if (logger?.error) logger.error(`[${ts()}] honcho ingest failed`, msg);
+      else console.error(`[${ts()}] honcho ingest failed`, msg);
+    });
+}
+
 async function setThinking(client, channel, threadTs, logger) {
   if (!channel || !threadTs) return;
   try {
@@ -403,6 +450,8 @@ async function postHoldAck(client, channel, text, fields, logger) {
  * Clear thinking as soon as the webhook is accepted. The text hold-ack is opt-in.
  */
 async function processInbound({ kind, event, client, logger, sayOnFail }) {
+  // Public mentions are ingestible. DMs fall out in the filter. Do not await.
+  fireHonchoIngest(event, honchoExtras(client, logger));
   const channel = event.channel;
   await addAckReaction(client, channel, event.ts, logger);
   const enriched = await enrichChannelType(client, event, logger);
@@ -458,6 +507,9 @@ app.event("app_mention", async ({ event, say, client, logger }) => {
 });
 
 app.message(async ({ message, client, logger }) => {
+  // Silent public-channel ingest. Does not set thinking or wake Grok.
+  // Slack only delivers these when message.channels is subscribed. DMs are filtered out.
+  fireHonchoIngest(message, honchoExtras(client, logger));
   if (!isUserPost(message)) return;
   if (message.channel_type !== "im" && message.channel_type !== "mpim") return;
   if (!firstWake(message.channel, message.ts)) return;

@@ -8,8 +8,15 @@
  * as the bridge, so an existing wake routine needs no change.
  *
  * Secrets (wrangler secret put): SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, GROK_WEBHOOK_URL,
- *                                GROK_WEBHOOK_SECRET (optional but recommended)
+ *                                GROK_WEBHOOK_SECRET (optional but recommended),
+ *                                HONCHO_API_KEY (used when HONCHO_INGEST or HONCHO_READ is on)
  * Vars (wrangler.toml [vars]):   see wrangler.toml.example
+ *
+ * HONCHO_INGEST defaults off. Public-channel memory writes run in ctx.waitUntil
+ * and are never awaited on the wakeGrok path.
+ * HONCHO_READ defaults off and is independent of ingest. When on, processInbound
+ * and forwardWatched await one session context and attach payload.honcho before
+ * wakeGrok. A slow or failed read still wakes (honcho.ok === false). See src/honcho.js.
  *
  * Acknowledgement is a reaction (ACK_REACTION, default white_check_mark). The text
  * hold-ack is opt-in (HOLD_ACK=true). Replies the Worker itself posts follow the
@@ -20,8 +27,21 @@
  * 3-second deadline is never at risk.
  */
 
+import { fetchWakeContext, honchoReadEnabled, ingestIfEnabled } from "./honcho.js";
+
 const enc = new TextEncoder();
-const FORWARD_SUBTYPES = new Set(["file_share"]);
+const FORWARD_SUBTYPES = new Set(["file_share", "slack_audio"]);
+const AUDIO_FT = new Set(["m4a", "mp3", "webm", "ogg", "wav", "mp4", "aac"]);
+
+/** Voice clips arrive as subtype slack_audio or as files with an audio mimetype. */
+export function hasAudio(e) {
+  if (!e) return false;
+  if (e.subtype === "slack_audio") return true;
+  return Array.isArray(e.files) && e.files.some((f) => {
+    const m = String(f?.mimetype || "");
+    return f?.subtype === "slack_audio" || m.startsWith("audio/") || m === "video/mp4" || AUDIO_FT.has(String(f?.filetype || "").toLowerCase());
+  });
+}
 const PERSONAL_BASE_TERMS = [
   "kids?", "child", "daughter", "son", "family", "school", "calendar",
   "schedule", "class(?:es)?", "lessons?", "practice", "activit(?:y|ies)", "sports?",
@@ -176,6 +196,8 @@ export function route(e, c) {
   if (ct === "channel" || ct === "group") {
     if (mentionsMe) return { action: "ignore", reason: "mention-handled-by-app_mention" };
     if (!c.watch.has(e.channel)) return { action: "ignore", reason: "not-watched" };
+    // Voice clips often have an empty caption. Wake before the chatter filter.
+    if (hasAudio(e)) return { action: "watched", reason: "watched-audio" };
     if (!worthForwarding(e.text, c)) return { action: "ignore", reason: "chatter" };
     return { action: "watched", reason: "watched-channel" };
   }
@@ -183,7 +205,7 @@ export function route(e, c) {
   if (ct === "mpim") {
     // An explicit @mention in a group DM also arrives as app_mention; let that one wake.
     if (mentionsMe) return { action: "ignore", reason: "mention-handled-by-app_mention" };
-    if (c.mpimRequireAddress && !addressesBot(e.text, c)) return { action: "ignore", reason: "mpim-not-addressed" };
+    if (c.mpimRequireAddress && !addressesBot(e.text, c) && !hasAudio(e)) return { action: "ignore", reason: "mpim-not-addressed" };
   }
   return { action: "wake_dm", reason: ct };
 }
@@ -218,7 +240,10 @@ async function slackApi(env, method, body, { get = false, quiet = false } = {}) 
 const channelKindCache = new Map();
 let loggedChannelScope = false;
 
-/** Fill in channel_type when the event omitted it (app_mention does). Failures are not cached. */
+/**
+ * Wake-path classifier. Still fail-open ("channel") when conversations.info
+ * cannot tell. Honcho ingest must not use this result: see lookupIngestChannel.
+ */
 async function resolveChannelType(env, e) {
   const ct = e?.channel_type;
   if (ct === "im" || ct === "mpim" || ct === "channel" || ct === "group") return ct;
@@ -336,6 +361,19 @@ async function postHoldAck(env, c, channel, fields, text) {
 }
 
 // ---------------------------------------------------------------- handlers (run in waitUntil)
+
+/** Session context for the wake payload. Fail-open: never throws. */
+async function honchoForWake(env, e) {
+  const honcho = await fetchWakeContext(env, {
+    channel: e?.channel,
+    user: e?.user,
+    text: e?.text,
+    channelType: e?.channel_type,
+  });
+  log("honcho read", honcho.ok ? "ok" : (honcho.error || "fail"), e?.channel, e?.ts, `${honcho.ms}ms`);
+  return honcho;
+}
+
 async function processInbound(env, c, kind, e, sayOnFail) {
   const channel = e.channel;
   const threadTs = e.thread_ts || e.ts;
@@ -344,13 +382,15 @@ async function processInbound(env, c, kind, e, sayOnFail) {
   await setThinking(env, c, channel, threadTs);
   try {
     const slack = await summarizeEvent(env, e);
-    await wakeGrok(env, {
+    const payload = {
       source: c.source,
       kind,
       slack,
       hold_ack: c.personalRe.test(String(slack.text || "")) ? "personal" : "generic",
       reply: placement,
-    });
+    };
+    if (honchoReadEnabled(env)) payload.honcho = await honchoForWake(env, e);
+    await wakeGrok(env, payload);
     log("wake ok", kind, channel, e.ts);
     await clearThinking(env, channel, threadTs);
     await postHoldAck(env, c, channel, placement, slack.text);
@@ -370,8 +410,11 @@ async function processInbound(env, c, kind, e, sayOnFail) {
 async function forwardWatched(env, c, e) {
   try {
     const slack = await summarizeEvent(env, e);
-    await wakeGrok(env, { source: c.source, kind: "channel_message", watched: true, slack, reply: replyFields(e) });
+    const payload = { source: c.source, kind: "channel_message", watched: true, slack, reply: replyFields(e) };
+    if (honchoReadEnabled(env)) payload.honcho = await honchoForWake(env, e);
+    await wakeGrok(env, payload);
     log("wake ok", "channel_message", e.channel, e.ts);
+    if (hasAudio(e)) await addAckReaction(env, c, e.channel, e.ts);
   } catch (err) {
     log("wake FAILED", "channel_message", e.channel, e.ts, err?.message || err);
   }
@@ -396,6 +439,41 @@ async function welcome(env, c, e) {
   const text = c.welcomeText.replaceAll("{user}", `<@${e.user}>`).replaceAll("{ask_channel}", where);
   await slackApi(env, "chat.postMessage", { channel: e.channel, text }).catch(() => {});
   log("welcomed", e.channel, e.user);
+}
+
+let loggedHonchoScope = false;
+
+// Ingest-only lookup. null means unresolved (missing_scope, no token, error).
+// Does not fail open to "channel". Cached by ingestIfEnabled.
+async function lookupIngestChannel(env, channel) {
+  if (!channel || !env.SLACK_BOT_TOKEN) return null;
+  const info = await slackApi(env, "conversations.info", { channel }, { get: true, quiet: true }).catch(() => null);
+  if (!info?.ok || !info.channel) {
+    if (info?.error === "missing_scope" && !loggedHonchoScope) {
+      loggedHonchoScope = true;
+      log("honcho conversations.info missing_scope; set HONCHO_CHANNEL_IDS until channels:read is granted");
+    }
+    return null;
+  }
+  return info.channel;
+}
+
+// Separate from wake. Runs for public messages route() ignores (the usual case
+// outside WATCH_CHANNEL_IDS) and for our own bot replies in public channels.
+// Returns null when HONCHO_INGEST is off. Caller must only waitUntil the promise.
+// Missing channel_type: HONCHO_CHANNEL_IDS, else conversations.info, else skip.
+function scheduleHoncho(env, c, e) {
+  return ingestIfEnabled(env, e, {
+    ownUserId: c.ownUserId,
+    ownBotId: c.ownBotId,
+    personalRe: c.personalRe,
+    log: (...a) => log(...a),
+    lookupChannel: (channel) => lookupIngestChannel(env, channel),
+    resolveDisplay: async (userId) => {
+      const u = await resolveUser(env, userId);
+      return u?.display_name || u?.real_name || u?.name || null;
+    },
+  });
 }
 
 async function handle(env, c, e, action) {
@@ -450,7 +528,12 @@ export default {
     const e = body.event;
     const { action, reason } = route(e, c);
     log("event", body.event_id, e?.type, e?.subtype || "", e?.channel, "->", action, reason, retryNum ? `retry=${retryNum}:${retryReason}` : "");
+    // Ingest is not on the wake path. Slack is acked below whether or not it runs.
+    // HONCHO_READ, when on, runs inside the waitUntil handlers before wakeGrok.
+    // message.channels must be subscribed or ordinary public messages never arrive.
+    const honchoTask = scheduleHoncho(env, c, e);
     if (action !== "ignore") ctx.waitUntil(handle(env, c, e, action).catch((err) => log("handler error", err?.message || err)));
+    if (honchoTask) ctx.waitUntil(honchoTask);
     return json({ ok: true }, 200, { "X-Relay-Action": `${action}:${reason}` });
   },
 };
