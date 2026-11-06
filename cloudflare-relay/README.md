@@ -40,7 +40,10 @@ Same routing and headers as the bridge. The webhook body adds a `reply` object; 
   (`channels:read`, `groups:read`, `im:read`, or `mpim:read`). If that call fails, the
   mention is treated as a channel.
 - Bots (including itself), edits, deletes and other subtypes are ignored, except `file_share`
-  (a user posting an image or PDF), which is forwarded with a `files` array.
+  (a user posting an image or PDF) and `slack_audio` (a voice clip). Both are forwarded
+  with a `files` array when Slack includes one. A file whose mimetype starts with `audio/`,
+  is `video/mp4`, or whose filetype is `m4a`, `mp3`, `webm`, `ogg`, `wav`, `mp4`, or `aac`
+  counts as audio even when the subtype is missing.
 - Every event response carries a debug header `X-Relay-Action: <action>:<reason>`.
 - `GET /health` → `{"ok":true,"configured":true}` once the required secrets exist.
 
@@ -54,16 +57,16 @@ Webhook request (identical to the bridge):
 
 | Var | Effect |
 |-----|--------|
-| `WATCH_CHANNEL_IDS` | Forward messages in these channels **without** an @mention, as `{ kind: "channel_message", watched: true, slack, reply }` (no thinking, reaction, or hold-ack). A cheap pre-filter skips short chatter: forwarded only if it has `BOT_NAME`, a `?`, or more than 4 words. Your routine must decide whether to answer. |
+| `WATCH_CHANNEL_IDS` | Forward messages in these channels **without** an @mention, as `{ kind: "channel_message", watched: true, slack, reply }` (no thinking or hold-ack). A cheap pre-filter skips short chatter: forwarded only if it has `BOT_NAME`, a `?`, or more than 4 words. Audio skips that filter, including an empty caption (`watched-audio`). After a successful audio wake the Worker adds `ACK_REACTION` on that message. Other watched forwards do not react. Your routine must decide whether to answer. |
 | `ACK_REACTION` | Emoji name without colons (default `white_check_mark`). `off` disables the reaction. A missing custom emoji falls back to `white_check_mark`. Missing `reactions:write` is logged. |
 | `HOLD_ACK` | `"true"` also posts the text hold-ack. Default off, so a new deploy does not double-ack. |
 | `HOLD_ACK_BROADCAST` | When the text hold-ack is on, also send it to the channel (default true). DMs are never broadcast. |
 | `HOLD_ACK_SKIP_REGEX` | Asks matching this regex get no text hold-ack (e.g. off-topic questions your routine will politely decline). |
 | `WELCOME_CHANNEL_IDS`, `WELCOME_TEXT`, `ASK_CHANNEL_ID` | New human joiners get a :wave: reaction and `WELCOME_TEXT` (`{user}`, `{ask_channel}` placeholders). Needs `reactions:write`. |
-| `BOT_NAME`, `MPIM_REQUIRE_ADDRESS` | With `MPIM_REQUIRE_ADDRESS="true"`, group DMs only wake the bot when it's @mentioned or `BOT_NAME` appears. |
+| `BOT_NAME`, `MPIM_REQUIRE_ADDRESS` | With `MPIM_REQUIRE_ADDRESS="true"`, group DMs only wake the bot when it's @mentioned, `BOT_NAME` appears, or the message is audio. |
 | `RETRY_POLICY` | See below. |
 
-`HOLD_ACK_DM_TOP_LEVEL` is no longer read. DM and group-DM placement follows the threading rule above. `ACK_REACTION` defaults on and `HOLD_ACK` defaults off. Watched-channel forwards still do not react or post a hold-ack. The other rows stay off until you set them.
+`HOLD_ACK_DM_TOP_LEVEL` is no longer read. DM and group-DM placement follows the threading rule above. `ACK_REACTION` defaults on and `HOLD_ACK` defaults off. Watched-channel text forwards still do not react or post a hold-ack. A watched voice clip gets `ACK_REACTION` only after the webhook succeeds. The other rows stay off until you set them.
 
 ### Slack retries and Delayed Events
 
@@ -140,7 +143,13 @@ In [api.slack.com/apps](https://api.slack.com/apps) → your app:
 
 ## Honcho ingest (off by default)
 
-`HONCHO_INGEST` in `[vars]` defaults to `"0"`. Public-channel writes run inside `ctx.waitUntil` after the Worker has already built the `200` response. `wakeGrok` does not call Honcho. There is no read path.
+`HONCHO_INGEST` in `[vars]` defaults to `"0"`. Public-channel writes run inside `ctx.waitUntil` after the Worker has already built the `200` response. `wakeGrok` does not call Honcho. Ingest itself does not read.
+
+### Optional wake-path reads (off by default)
+
+`HONCHO_READ` is independent of `HONCHO_INGEST` and defaults to `"0"`. When it is `"1"`, `processInbound` and `forwardWatched` GET the per-channel session (`channel-<id>`) and attach the result as `payload.honcho` before `wakeGrok`. `HONCHO_READ_TIMEOUT_MS` defaults to `1500` and is capped at `15000`. A missing key, HTTP error, or timeout still wakes Grok with `honcho.ok === false`. The read runs in `ctx.waitUntil`, so the Slack `200` is not delayed. Socket Mode stays write-only; this read hook is on the Worker module, which `node-http-relay` imports.
+
+`HONCHO_API_KEY` is required for ingest and for reads. Set it with `npx wrangler secret put`, not in `wrangler.toml`.
 
 `HONCHO_CHANNEL_IDS` is optional. Set it to comma-separated public channel ids. The current bot token gets `missing_scope` from `conversations.info` (no `channels:read`). Events that already include `channel_type: channel` still ingest. `app_mention` often has no type: those are ingested only when the channel id is in `HONCHO_CHANNEL_IDS`, or when `conversations.info` succeeds and says the channel is public. A failed lookup does not treat a `C` id as public, so a group-DM mention is not written. Wake routing is unchanged.
 
