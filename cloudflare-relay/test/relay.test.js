@@ -1,7 +1,7 @@
 // Offline tests: no network. Run with `npm test` (Node 20+).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import worker, { route, cfg, dropRetry, slackSignature, ackEmoji, replyFields, postMessageArgs } from "../src/index.js";
+import worker, { route, cfg, dropRetry, slackSignature, ackEmoji, replyFields, postMessageArgs, hasAudio } from "../src/index.js";
 import { resetHonchoState } from "../src/honcho.js";
 
 const SECRET = "test-signing-secret";
@@ -75,6 +75,45 @@ test("routing", () => {
   const strict = cfg({ ...baseEnv, MPIM_REQUIRE_ADDRESS: "true", BOT_NAME: "mybot" });
   assert.equal(route({ type: "message", channel_type: "mpim", channel: "G1", user: "UHUMAN", text: "lunch?" }, strict).action, "ignore");
   assert.equal(route({ type: "message", channel_type: "mpim", channel: "G1", user: "UHUMAN", text: "mybot lunch?" }, strict).action, "wake_dm");
+});
+
+test("audio wakes watched channels and group DMs that require an address", () => {
+  const c = cfg({ ...baseEnv, WATCH_CHANNEL_IDS: "CWATCH", BOT_NAME: "mybot" });
+  const audioFile = {
+    type: "message",
+    channel_type: "channel",
+    channel: "CWATCH",
+    user: "UHUMAN",
+    text: "",
+    files: [{ id: "F1", name: "clip.m4a", mimetype: "audio/mp4", filetype: "m4a" }],
+  };
+  assert.equal(hasAudio(audioFile), true);
+  assert.deepEqual(route(audioFile, c), { action: "watched", reason: "watched-audio" });
+  assert.equal(
+    route({ type: "message", channel_type: "channel", channel: "CWATCH", user: "UHUMAN", text: "ok" }, c).reason,
+    "chatter",
+  );
+  assert.equal(
+    route({ type: "message", channel_type: "channel", channel: "CWATCH", user: "UHUMAN", subtype: "slack_audio", text: "" }, c).reason,
+    "watched-audio",
+  );
+
+  const strict = cfg({ ...baseEnv, MPIM_REQUIRE_ADDRESS: "true", BOT_NAME: "mybot" });
+  const mpimAudio = {
+    type: "message",
+    channel_type: "mpim",
+    channel: "G1",
+    user: "UHUMAN",
+    text: "voice note",
+    files: [{ id: "F2", mimetype: "audio/webm", filetype: "webm" }],
+  };
+  assert.equal(route(mpimAudio, strict).action, "wake_dm");
+  assert.equal(route({ type: "message", channel_type: "mpim", channel: "G1", user: "UHUMAN", text: "lunch?" }, strict).action, "ignore");
+
+  const clip = { type: "message", channel_type: "im", channel: "D1", user: "UHUMAN", subtype: "slack_audio", text: "" };
+  assert.equal(hasAudio(clip), true);
+  assert.equal(route(clip, c).action, "wake_dm");
+  assert.equal(route({ type: "message", channel_type: "im", channel: "D1", user: "UHUMAN", subtype: "message_changed", text: "" }, c).action, "ignore");
 });
 
 test("ack emoji and reply placement", () => {
@@ -419,6 +458,131 @@ test("unresolved channel_type does not ingest unless HONCHO_CHANNEL_IDS lists it
     assert.ok(message, "allowlisted mention was ingested");
     assert.equal(message.body.messages[0].metadata.channel, "CPUBLIC");
     assert.equal(message.body.messages[0].peer_id, "UHUMAN");
+  });
+});
+
+test("watched audio reacts only after a successful wake", async () => {
+  const calls = [];
+  await withMockFetch(async (url, opts = {}) => {
+    const u = String(url);
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    calls.push({ url: u, body });
+    if (u.includes("users.info")) return jsonResponse({ ok: true, user: { id: "UHUMAN", name: "someone", profile: {} } });
+    if (u.includes("reactions.add")) return jsonResponse({ ok: true });
+    if (u.includes("example.test/hook") && body?.slack?.ts === "9.9") return new Response("nope", { status: 500 });
+    return new Response("ok", { status: 200 });
+  }, async () => {
+    const env = { ...baseEnv, SLACK_BOT_TOKEN: "xoxb-test", GROK_WEBHOOK_URL: "https://example.test/hook", WATCH_CHANNEL_IDS: "CWATCH" };
+    const audio = {
+      type: "message",
+      channel_type: "channel",
+      channel: "CWATCH",
+      user: "UHUMAN",
+      text: "",
+      ts: "8.8",
+      files: [{ id: "F1", name: "clip.m4a", mimetype: "audio/mp4", filetype: "m4a" }],
+    };
+    const ok = await post({ type: "event_callback", event: audio }, { env });
+    assert.equal(ok.res.headers.get("X-Relay-Action"), "watched:watched-audio");
+    await Promise.all(ok.waited);
+    const wake = calls.find((c) => c.url.includes("example.test/hook") && c.body?.slack?.ts === "8.8");
+    assert.ok(wake);
+    assert.equal(wake.body.honcho, undefined);
+    assert.equal(wake.body.kind, "channel_message");
+    assert.equal(wake.body.watched, true);
+    assert.equal(wake.body.reply.thread_ts, "8.8");
+    assert.equal(wake.body.reply.reply_broadcast, true);
+    const wakeIndex = calls.findIndex((c) => c.url.includes("example.test/hook") && c.body?.slack?.ts === "8.8");
+    const reactIndex = calls.findIndex((c) => c.url.includes("reactions.add"));
+    assert.ok(wakeIndex >= 0 && reactIndex > wakeIndex);
+    assert.equal(calls[reactIndex].body.name, "white_check_mark");
+    assert.equal(calls[reactIndex].body.timestamp, "8.8");
+    assert.equal(calls[reactIndex].body.channel, "CWATCH");
+
+    calls.length = 0;
+    const failed = await post({ type: "event_callback", event: { ...audio, ts: "9.9" } }, { env });
+    await Promise.all(failed.waited);
+    assert.equal(calls.some((c) => c.url.includes("example.test/hook")), true);
+    assert.equal(calls.some((c) => c.url.includes("reactions.add")), false);
+  });
+});
+
+test("HONCHO_READ attaches context inside waitUntil and still wakes when the read times out", async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const calls = [];
+  await withMockFetch(async (url, opts = {}) => {
+    const u = String(url);
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    calls.push({ url: u, body, auth: opts.headers?.Authorization || opts.headers?.get?.("Authorization") });
+    if (u.includes("/context")) {
+      if (u.includes("channel-Cpublic1")) {
+        const err = new Error("The operation was aborted due to timeout");
+        err.name = "TimeoutError";
+        throw err;
+      }
+      await gate;
+      return jsonResponse({
+        summary: { content: "Earlier lab notes." },
+        messages: [{ content: "the readout looks stable" }],
+      });
+    }
+    if (u.includes("users.info")) return jsonResponse({ ok: true, user: { id: "Uhuman1", name: "someone", profile: {} } });
+    if (u.includes("reactions.add") || u.includes("assistant.threads")) return jsonResponse({ ok: true });
+    return new Response("ok", { status: 200 });
+  }, async () => {
+    const env = {
+      ...baseEnv,
+      SLACK_BOT_TOKEN: "xoxb-test",
+      GROK_WEBHOOK_URL: "https://example.test/hook",
+      HONCHO_READ: "1",
+      HONCHO_API_KEY: "hk-test",
+      HONCHO_WORKSPACE_ID: "example-workspace",
+      WATCH_CHANNEL_IDS: "Cpublic1",
+    };
+    let waited = [];
+    try {
+      const dm = await post(
+        { type: "event_callback", event: { type: "message", channel_type: "im", channel: "D1", user: "Uhuman1", text: "hello there", ts: "4.4" } },
+        { env },
+      );
+      waited = dm.waited;
+      assert.equal(dm.res.status, 200);
+      assert.equal(dm.res.headers.get("X-Relay-Action"), "wake_dm:im");
+      await settleBackground();
+      assert.equal(calls.some((c) => c.url.includes("example.test/hook")), false);
+      release();
+      await Promise.all(dm.waited);
+      const wake = calls.find((c) => c.url.includes("example.test/hook"));
+      assert.equal(wake.body.honcho.ok, true);
+      assert.equal(wake.body.honcho.summary, "Earlier lab notes.");
+      assert.equal(wake.body.honcho.sessionId, "channel-D1");
+      assert.deepEqual(wake.body.honcho.recent, ["the readout looks stable"]);
+      assert.equal(wake.body.reply.thread_ts, null);
+      assert.equal(wake.body.reply.reply_broadcast, false);
+      const context = calls.find((c) => c.url.includes("/context"));
+      assert.match(context.url, /\/workspaces\/example-workspace\/sessions\/channel-D1\/context/);
+      assert.match(context.url, /peer_target=Uhuman1/);
+
+      calls.length = 0;
+      const watched = await post(
+        { type: "event_callback", event: { type: "message", channel_type: "channel", channel: "Cpublic1", user: "Uhuman1", text: "please review the experiment log today", ts: "1710000099.1" } },
+        { env },
+      );
+      waited = watched.waited;
+      assert.equal(watched.res.headers.get("X-Relay-Action"), "watched:watched-channel");
+      await Promise.all(watched.waited);
+      const timed = calls.find((c) => c.url.includes("example.test/hook"));
+      assert.ok(timed);
+      assert.equal(timed.body.honcho.ok, false);
+      assert.equal(timed.body.honcho.error, "timeout");
+      assert.equal(timed.body.honcho.sessionId, "channel-Cpublic1");
+      assert.equal(timed.body.reply.reply_broadcast, true);
+      assert.equal(calls.some((c) => c.url.includes("reactions.add")), false);
+    } finally {
+      release();
+      await Promise.all(waited);
+    }
   });
 });
 
