@@ -1,8 +1,13 @@
 /**
- * Honcho phase A: fire-and-forget public-channel memory writes.
+ * Honcho public-channel memory.
  *
  * Live ingest is a no-op unless HONCHO_INGEST is "1" / "true" / "yes" / "on".
- * Unset, "0", and "false" do nothing. This module never reads Honcho.
+ * Unset, "0", and "false" do nothing. Ingest writes only.
+ *
+ * Wake-path reads are a separate kill switch (HONCHO_READ, default off),
+ * independent of HONCHO_INGEST. When that switch is on, this module can read:
+ * one GET of the per-channel session context, attached by the caller as
+ * payload.honcho. A slow or failed read returns { ok: false } and does not throw.
  *
  * Session id: one session per public Slack channel, `channel-<channelId>`.
  * Honcho ids only allow [A-Za-z0-9_-], so the id is a prefix plus the channel id,
@@ -467,4 +472,132 @@ export function ingestIfEnabled(env, event, opts = {}) {
     .catch((err) => {
       (opts.log || console.log)("honcho ingest failed", err?.message || err);
     });
+}
+
+/** Wake-path context kill switch. Default off. Independent of HONCHO_INGEST. */
+export function honchoReadEnabled(env) {
+  const v = env?.HONCHO_READ;
+  if (v === undefined || v === null || String(v).trim() === "") return false;
+  const s = String(v).trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "on";
+}
+
+function readTimeoutMs(env) {
+  const n = Number.parseInt(env?.HONCHO_READ_TIMEOUT_MS ?? "1500", 10);
+  if (!Number.isFinite(n) || n < 1) return 1500;
+  return Math.min(n, 15000);
+}
+
+function truncateLine(s, max = 240) {
+  const t = String(s || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  return t.length > max ? `${t.slice(0, max - 1)}...` : t;
+}
+
+function summarizeRecent(messages, limit = 8) {
+  if (!Array.isArray(messages) || !messages.length) return [];
+  const out = [];
+  for (const m of messages.slice(-limit)) {
+    const line = truncateLine(m?.content);
+    if (line) out.push(line);
+  }
+  return out;
+}
+
+function summaryText(summary) {
+  if (!summary) return null;
+  if (typeof summary === "string") return truncateLine(summary, 2000) || null;
+  if (typeof summary === "object" && summary.content != null) {
+    return truncateLine(summary.content, 2000) || null;
+  }
+  return null;
+}
+
+function errorFromCatch(err) {
+  const name = err?.name || "";
+  const msg = String(err?.message || err || "error");
+  return name === "TimeoutError" || /aborted|timeout/i.test(msg)
+    ? "timeout"
+    : truncateLine(msg, 120) || "error";
+}
+
+/** One session context GET. Never throws. Always includes ms. Fail-open. */
+async function fetchSessionContext(env, sessionId, opts = {}) {
+  const started = Date.now();
+  const done = (extra) => ({ ms: Date.now() - started, sessionId, ...extra });
+  try {
+    const key = env?.HONCHO_API_KEY;
+    if (!key) return done({ ok: false, error: "no-key" });
+    if (!sessionId || !ID_RE.test(sessionId)) return done({ ok: false, error: "bad-session" });
+    const ws = workspaceIdOf(env);
+    if (!ID_RE.test(ws)) return done({ ok: false, error: "bad-workspace" });
+
+    const peer = String(opts.peer || "").trim();
+    const params = new URLSearchParams();
+    params.set("tokens", String(opts.tokens ?? 1200));
+    params.set("summary", opts.summary === false ? "false" : "true");
+    if (peer && ID_RE.test(peer)) params.set("peer_target", peer);
+
+    const fetchImpl = opts.fetchImpl || globalThis.fetch;
+    const base = String(env.HONCHO_API_BASE || HONCHO_BASE).replace(/\/$/, "");
+    const path = `/v3/workspaces/${encodeURIComponent(ws)}/sessions/${encodeURIComponent(sessionId)}/context?${params}`;
+    const timeoutMs = opts.timeoutMs ?? readTimeoutMs(env);
+    const res = await fetchImpl(`${base}${path}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return done({ ok: false, error: `http-${res.status}` });
+    const body = await res.json().catch(() => null);
+    if (!body || typeof body !== "object") return done({ ok: false, error: "bad-json" });
+    return done({
+      ok: true,
+      summary: summaryText(body.summary),
+      peer_representation: body.peer_representation != null
+        ? truncateLine(body.peer_representation, 2000)
+        : null,
+      peer_card: Array.isArray(body.peer_card)
+        ? body.peer_card.map((x) => truncateLine(x, 200)).filter(Boolean).slice(0, 12)
+        : null,
+      recent: summarizeRecent(body.messages, opts.recentLimit ?? 8),
+    });
+  } catch (err) {
+    return done({ ok: false, error: errorFromCatch(err) });
+  }
+}
+
+/**
+ * Session context for the wake payload. Prefer this over peer /chat (too slow).
+ * Never throws. Always includes ms. Fail-open for the caller.
+ * Only the per-channel session (`channel-<id>`). No extra sessions.
+ */
+export async function fetchWakeContext(env, { channel, user, text, channelType } = {}, opts = {}) {
+  const started = Date.now();
+  const done = (extra) => ({ ms: Date.now() - started, ...extra });
+  try {
+    const key = env?.HONCHO_API_KEY;
+    if (!key) return done({ ok: false, error: "no-key" });
+    const channelId = String(channel || "").trim();
+    if (!channelId || !ID_RE.test(channelId)) return done({ ok: false, error: "bad-channel" });
+    const ws = workspaceIdOf(env);
+    if (!ID_RE.test(ws)) return done({ ok: false, error: "bad-workspace" });
+    const sessionId = sessionIdForChannel(channelId);
+    if (!ID_RE.test(sessionId)) return done({ ok: false, error: "bad-session" });
+
+    void text;
+    void channelType;
+
+    const channelCtx = await fetchSessionContext(env, sessionId, {
+      peer: String(user || "").trim(),
+      tokens: opts.tokens,
+      summary: opts.summary,
+      recentLimit: opts.recentLimit,
+      fetchImpl: opts.fetchImpl,
+      timeoutMs: opts.timeoutMs ?? readTimeoutMs(env),
+    });
+    const { sessionId: _sid, ...rest } = channelCtx;
+    return done({ ...rest, sessionId });
+  } catch (err) {
+    return done({ ok: false, error: errorFromCatch(err) });
+  }
 }

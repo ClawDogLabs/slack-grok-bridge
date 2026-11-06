@@ -153,7 +153,9 @@ Patterns for the routine, not extra bridge code:
 
 ## Honcho memory ingest (off by default)
 
-Phase A writes public-channel Slack messages to [Honcho](https://honcho.dev) after the Slack ack. It does not read Honcho, and it does not run on the Grok wake path.
+Phase A writes public-channel Slack messages to [Honcho](https://honcho.dev) after the Slack ack. Ingest does not read Honcho and does not run inside `wakeGrok`.
+
+The HTTP relay (Cloudflare Worker and `node-http-relay`, the same module) has a separate switch, `HONCHO_READ`, default off. When it is on, the wake handlers fetch that channel's session context and attach `payload.honcho` before the webhook. A failed or slow read still wakes (`honcho.ok === false`). Socket Mode stays write-only.
 
 `HONCHO_INGEST` defaults off (`0` / unset / `false`). Set it to `1` only after the checklist in the relay README. `HONCHO_API_KEY` is a secret (wrangler secret or `.env`, never committed). `HONCHO_WORKSPACE_ID` defaults to `princeton-ai-slack`.
 
