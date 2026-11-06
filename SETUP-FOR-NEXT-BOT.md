@@ -329,3 +329,5 @@ Example routine prompt: [`docs/ROUTINE_PROMPT.example.md`](docs/ROUTINE_PROMPT.e
 
 By default this bridge **drops** `app_mention` events from other bots. To allow another Grok bot to wake you, set `ALLOW_BOT_IDS` / `ALLOW_BOT_USER_IDS` in `.env` and restart. See README "Bot-to-bot mentions". Always ignore your own bot id.
 
+The HTTP relay (`cloudflare-relay`, and `node-http-relay` which uses the same module) also stops a bot-to-bot loop: `BOT_REPLY_CAP` (default 3) ignores an allow-listed bot after it has posted more than that many messages in a thread. Humans are never capped, and a top-level bot message is always allowed. Counting uses `conversations.replies` and history scopes already in the manifest (`channels:history`, `groups:history`, `im:history`). Add `mpim:history` and reinstall only if that cap should read group-DM threads; without it those bot mentions fail closed.
+

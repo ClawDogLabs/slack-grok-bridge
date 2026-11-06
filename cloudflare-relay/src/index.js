@@ -120,6 +120,7 @@ export function cfg(env) {
     askChannel: env.ASK_CHANNEL_ID || null,
     allowBotIds: idSet(env.ALLOW_BOT_IDS),
     allowBotUserIds: idSet(env.ALLOW_BOT_USER_IDS),
+    botReplyCap: Number.parseInt(env.BOT_REPLY_CAP || "3", 10) || 3,
     retryPolicy: (env.RETRY_POLICY || "drop_timeouts").toLowerCase(),
   };
 }
@@ -419,6 +420,17 @@ async function forwardWatched(env, c, e) {
   }
 }
 
+/** Bot-to-bot loop cap: ignore an allow-listed bot once it has posted BOT_REPLY_CAP messages in this thread. */
+async function botCapReached(env, c, e) {
+  if (!e.bot_id && e.subtype !== "bot_message") return false; // humans are never capped
+  const ts = e.thread_ts || e.ts;
+  if (!e.thread_ts) return false; // first top-level bot message always allowed
+  const r = await slackApi(env, "conversations.replies", { channel: e.channel, ts, limit: "200" }, { get: true }).catch(() => null);
+  if (!r?.ok) return true; // fail closed for bots
+  const n = (r.messages || []).filter((m) => m.bot_id && m.bot_id === e.bot_id).length;
+  return n > c.botReplyCap;
+}
+
 async function welcome(env, c, e) {
   const info = await resolveUser(env, e.user);
   if (info?.is_bot) return;
@@ -466,6 +478,10 @@ function scheduleHoncho(env, c, e) {
 
 async function handle(env, c, e, action) {
   if (action === "welcome") return welcome(env, c, e);
+  if (action === "wake_mention" && await botCapReached(env, c, e)) {
+    log("bot reply cap reached; ignoring", e.bot_id, e.channel, e.thread_ts);
+    return;
+  }
   const event = { ...e, channel_type: await resolveChannelType(env, e) };
   if (action === "wake_mention") return processInbound(env, c, "app_mention", event, true);
   if (action === "wake_dm") return processInbound(env, c, "message", event, false);

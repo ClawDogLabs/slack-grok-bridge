@@ -240,6 +240,8 @@ Slack delivers `app_mention` when another bot tags you, but **this bridge ignore
 Example: allow another bot with `ALLOW_BOT_IDS=B0XXXXXXX` and `ALLOW_BOT_USER_IDS=U0XXXXXXX` (get the real ids for that bot via `users.info`).
 Each workspace/app maintains its **own** allowlist; ask the other owner to allow you back if you need two-way tags.
 
+The Socket Mode bridge does not count messages. The HTTP relay does. [`cloudflare-relay`](./cloudflare-relay/README.md) (and [`node-http-relay`](./node-http-relay/README.md), which runs the same module) ignores an allow-listed bot in a thread after that bot has posted more than `BOT_REPLY_CAP` messages there (default `3`). Set it in the Worker's `[vars]` or the Node relay's environment. Humans are never capped. A top-level bot message is always allowed. If the thread cannot be read, the relay ignores the bot mention. Counting uses `conversations.replies` and the history scopes already in the manifest (`channels:history`, `groups:history`, `im:history`). No manifest change is required for channels or DMs. Group DMs need `mpim:history`, which the manifest does not include; without it the relay fails closed for bot mentions in group-DM threads. Add that scope and reinstall only if the cap should count messages there.
+
 ## Lessons learned (running it for real)
 
 Notes from running this bridge on a Grok Bot computer in a real workspace.

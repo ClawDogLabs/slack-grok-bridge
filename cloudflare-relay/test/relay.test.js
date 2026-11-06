@@ -59,6 +59,8 @@ test("routing", () => {
   const r = (e) => route(e, c).action;
   assert.equal(r({ type: "app_mention", channel: "C1", user: "UHUMAN", text: `<@${ME}> hi` }), "wake_mention");
   assert.equal(r({ type: "app_mention", channel: "C1", bot_id: "BOTHER", text: `<@${ME}>` }), "ignore");
+  const allowedBot = cfg({ ...baseEnv, ALLOW_BOT_IDS: "BOTHER" });
+  assert.equal(route({ type: "app_mention", channel: "C1", bot_id: "BOTHER", text: `<@${ME}>` }, allowedBot).action, "wake_mention");
   assert.equal(r({ type: "app_mention", channel: "D1", user: "UHUMAN", text: `<@${ME}>` }), "ignore");
   assert.equal(r({ type: "message", channel_type: "im", channel: "D1", user: "UHUMAN", text: "hi" }), "wake_dm");
   assert.equal(r({ type: "message", channel_type: "im", channel: "D1", user: "UHUMAN", subtype: "file_share", text: "" }), "wake_dm");
@@ -127,6 +129,9 @@ test("ack emoji and reply placement", () => {
   assert.equal(cfg({ HOLD_ACK: "true" }).holdAck, true);
   assert.equal(cfg({}).ackReaction, "white_check_mark");
   assert.equal(cfg({ ACK_REACTION: "off" }).ackReaction, null);
+  assert.equal(cfg({}).botReplyCap, 3);
+  assert.equal(cfg({ BOT_REPLY_CAP: "5" }).botReplyCap, 5);
+  assert.equal(cfg({ BOT_REPLY_CAP: "nope" }).botReplyCap, 3);
 
   assert.deepEqual(replyFields({ channel: "D1", channel_type: "im", ts: "1.1" }), { thread_ts: null, reply_broadcast: false });
   assert.deepEqual(replyFields({ channel: "D1", channel_type: "im", ts: "2.2", thread_ts: "1.1" }), { thread_ts: "1.1", reply_broadcast: false });
@@ -583,6 +588,80 @@ test("HONCHO_READ attaches context inside waitUntil and still wakes when the rea
       release();
       await Promise.all(waited);
     }
+  });
+});
+
+test("bot reply cap ignores further allow-listed bot mentions in a thread", async () => {
+  const calls = [];
+  let replies = { ok: true, messages: [] };
+  await withMockFetch(async (url) => {
+    const u = String(url);
+    calls.push(u);
+    if (u.includes("conversations.replies")) {
+      const q = new URL(u).searchParams;
+      assert.equal(q.get("limit"), "200");
+      assert.equal(q.get("channel"), "C1");
+      assert.equal(q.get("ts"), "1.1");
+      return jsonResponse(replies);
+    }
+    if (u.includes("conversations.info")) return jsonResponse({ ok: true, channel: { is_channel: true } });
+    if (u.includes("users.info")) return jsonResponse({ ok: true, user: { id: "UBOTUSER", name: "otherbot", is_bot: true, profile: {} } });
+    if (u.includes("reactions.add") || u.includes("assistant.threads")) return jsonResponse({ ok: true });
+    return new Response("ok", { status: 200 });
+  }, async () => {
+    const env = {
+      ...baseEnv,
+      SLACK_BOT_TOKEN: "xoxb-test",
+      GROK_WEBHOOK_URL: "https://example.test/hook",
+      ALLOW_BOT_IDS: "BOTHER",
+      ACK_REACTION: "off",
+    };
+    const mention = (event, extra = {}) => post({ type: "event_callback", event }, { env: { ...env, ...extra } });
+    const woke = () => calls.some((u) => u.includes("example.test/hook"));
+    const readThread = () => calls.some((u) => u.includes("conversations.replies"));
+    const reset = () => { calls.length = 0; };
+
+    reset();
+    const human = await mention({ type: "app_mention", channel: "C1", user: "UHUMAN", text: `<@${ME}> hi`, ts: "2.2", thread_ts: "1.1" });
+    await Promise.all(human.waited);
+    assert.equal(readThread(), false);
+    assert.equal(woke(), true);
+
+    reset();
+    const top = await mention({ type: "app_mention", channel: "C1", bot_id: "BOTHER", user: "UBOTUSER", text: `<@${ME}> hi`, ts: "3.3" });
+    await Promise.all(top.waited);
+    assert.equal(readThread(), false);
+    assert.equal(woke(), true);
+
+    reset();
+    replies = { ok: true, messages: [{ bot_id: "BOTHER" }, { bot_id: "BOTHER" }, { bot_id: "BBOT0001" }, { bot_id: "BOTHER" }] };
+    const under = await mention({ type: "app_mention", channel: "C1", bot_id: "BOTHER", user: "UBOTUSER", text: `<@${ME}> hi`, ts: "4.4", thread_ts: "1.1" });
+    await Promise.all(under.waited);
+    assert.equal(readThread(), true);
+    assert.equal(woke(), true);
+
+    reset();
+    replies = { ok: true, messages: [{ bot_id: "BOTHER" }, { bot_id: "BOTHER" }, { bot_id: "BOTHER" }, { bot_id: "BOTHER" }] };
+    const over = await mention({ type: "app_mention", channel: "C1", bot_id: "BOTHER", user: "UBOTUSER", subtype: "bot_message", text: `<@${ME}> again`, ts: "5.5", thread_ts: "1.1" });
+    await Promise.all(over.waited);
+    assert.equal(readThread(), true);
+    assert.equal(woke(), false);
+
+    reset();
+    replies = { ok: false, error: "missing_scope" };
+    const closed = await mention({ type: "app_mention", channel: "C1", bot_id: "BOTHER", text: `<@${ME}> hi`, ts: "6.6", thread_ts: "1.1" });
+    await Promise.all(closed.waited);
+    assert.equal(readThread(), true);
+    assert.equal(woke(), false);
+
+    reset();
+    replies = { ok: true, messages: [{ bot_id: "BOTHER" }, { bot_id: "BOTHER" }] };
+    const tight = await mention(
+      { type: "app_mention", channel: "C1", bot_id: "BOTHER", text: `<@${ME}> hi`, ts: "7.7", thread_ts: "1.1" },
+      { BOT_REPLY_CAP: "1" },
+    );
+    await Promise.all(tight.waited);
+    assert.equal(woke(), false);
   });
 });
 
