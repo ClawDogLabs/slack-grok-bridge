@@ -23,9 +23,9 @@
  * channel_type are still filtered (im / mpim / group dropped). With an
  * allowlist set, ids outside the list are skipped even if typed public.
  *
- * Log user "samplebot" (and BOT_NAME / the auth.test username) is stored as
+ * A log label listed in BOT_NAME, or the auth.test username, is stored as
  * OWN_USER_ID, or auth.test user_id when OWN_USER_ID is unset. Never the
- * label string.
+ * label string. No bot name is built into this script.
  *
  * Required for --write: HONCHO_API_KEY.
  * Optional: HONCHO_WORKSPACE_ID (default slack-workspace), PERSONAL_NAMES,

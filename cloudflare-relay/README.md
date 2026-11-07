@@ -219,7 +219,7 @@ Deploy this the same way as the mute: cherry-pick onto the source that matches t
 2. In Slack, **Event Subscriptions → Subscribe to bot events**, add `message.channels` if it is not already there. Save. Reinstall only if Slack asks. Do not add `message.groups` for this phase (private channels are filtered out). The bot must already be in the channel. `channels:history` is the matching scope (already on the sample manifest).
 3. Dry-run history from the repo root. Pass the public channel ids, because log rows have no `channel_type` and `conversations.info` fails closed without `channels:read`:
    `node --env-file=.env scripts/honcho-backfill.mjs --dry-run --channel-ids C0123,C0456`
-   `--write` posts. The script does not use the Worker. `samplebot` in the log is written as `OWN_USER_ID` (or `auth.test` `user_id`), not the string `samplebot`.
+   `--write` posts. The script does not use the Worker. A `BOT_NAME` label in the log is written as `OWN_USER_ID` (or `auth.test` `user_id`), not as that label.
 4. `npx wrangler secret put HONCHO_API_KEY`, confirm `HONCHO_WORKSPACE_ID` (`slack-workspace` if unset), then set `HONCHO_INGEST = "1"` and deploy again.
 5. Watch `npx wrangler tail` for `honcho ok` / `honcho skip`. A DM must not produce a Honcho post.
 6. Rollback: set `HONCHO_INGEST` back to `"0"` (or delete the var) and deploy. Ingest becomes a no-op. Already stored Honcho messages are left as-is.

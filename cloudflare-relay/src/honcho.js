@@ -13,8 +13,8 @@
  * Honcho ids only allow [A-Za-z0-9_-], so the id is a prefix plus the channel id,
  * not channel:id. One session keeps that room together for a later on-demand read.
  *
- * Peer id is the Slack user id (U... or W...). A log label such as "samplebot" is
- * never used as a peer id. Message content is "<author>: <text>" when a display
+ * Peer id is the Slack user id (U... or W...). A log label is never used as a
+ * peer id. Message content is "<author>: <text>" when a display
  * name or user id is available. slack_ts is stored on metadata.
  *
  * Channel scope: channel_type "channel" is public. A C id is not. Group DMs can
@@ -162,9 +162,9 @@ export function isSlackUserId(value) {
   return SLACK_USER_ID.test(String(value || "").trim());
 }
 
-/** Built-in "samplebot" plus any extra bot labels (BOT_NAME, auth.test username). */
+/** Bot labels from BOT_NAME and the auth.test username. No name is built in. */
 export function botLabelSet(extra) {
-  const labels = new Set(["samplebot"]);
+  const labels = new Set();
   const list = Array.isArray(extra) ? extra : String(extra || "").split(",");
   for (const item of list) {
     const label = String(item || "").trim().toLowerCase().replace(/^@/, "");
@@ -174,7 +174,7 @@ export function botLabelSet(extra) {
 }
 
 /**
- * Log user "samplebot" (and the same kind of bot label) becomes OWN_USER_ID.
+ * A configured bot label becomes OWN_USER_ID.
  * Anything that is not a Slack user id and not a known bot label is refused.
  */
 export function mapLogPeer(user, { ownUserId, labels } = {}) {
