@@ -41,6 +41,12 @@ ASK_CHANNEL_ID = ""                   # channel referenced as {ask_channel} in W
 WELCOME_TEXT = ""                     # placeholders {user} and {ask_channel}; a generic default is used if empty
 RETRY_POLICY = "drop_timeouts"        # drop_timeouts | drop_all | process_all (see README)
 
+# Mute. Comma-separated channel ids. HTTP 200 and nothing else: no reaction
+# (including a custom ack emoji), no thinking status, no hold-ack, no welcome,
+# no Grok wake, no Honcho write. Edits, joins, threads, and retries included.
+# Does not enable recording. Do not also list these ids in HONCHO_CHANNEL_IDS.
+SILENT_CHANNEL_IDS = ""
+
 # Honcho phase A. Default off. "1" writes public-channel messages after the Slack ack.
 # DMs, group DMs, and private channels are not written. Ingest does not read Honcho.
 HONCHO_INGEST = "0"

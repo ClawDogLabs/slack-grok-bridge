@@ -147,6 +147,25 @@ In [api.slack.com/apps](https://api.slack.com/apps) → your app:
 5. Test: DM the bot, and @mention it in a channel it's in, while watching
    `npx wrangler tail slack-bridge-example`.
 
+## Mute a channel (no recording)
+
+`SILENT_CHANNEL_IDS` is a comma-separated list of Slack channel ids. For every event in those channels the Worker returns HTTP 200 and stops. It does not call `reactions.add` (so a custom ack such as `sample-ack` is not added), `assistant.threads.setStatus`, `chat.postMessage`, `conversations.replies`, or the Grok webhook, and it does not write Honcho. The check is in front of `auth.test`, routing, welcome, watched-channel wakes, and ingest. It covers `app_mention` (including messages with an `edited` field), `message`, `message_changed` (channel on the outer event or on `message.channel`), thread replies, `channel_join` / `group_join`, `member_joined_channel`, and Slack retries.
+
+Listing a channel does **not** turn on recording. Leave `HONCHO_INGEST` as it is. Do **not** add the muted id to `HONCHO_CHANNEL_IDS` (that list is the public-ingest allowlist and would store messages on the shared Slack user peer). Backfill skips muted ids the same way.
+
+`message.groups` and `groups:history` are **not** required for this mute. Mentions in a private channel already arrive as `app_mention`, which is the path that was adding the ack and the thinking status. Those subscription and scope checks matter only before a later recording enablement. Recording stays off until that privacy path is reviewed and explicitly switched on. This change does not add that switch.
+
+Deploy the mute (do this only when you intend to ship; this repo does not deploy it):
+
+1. Deploy **this** revision of the Worker before relying on the variable. An older Worker ignores `SILENT_CHANNEL_IDS` and will keep acking.
+2. Set `SILENT_CHANNEL_IDS = "C0SYNTH0001"` in `[vars]` and deploy again. One deploy of this revision with the variable already set is enough.
+3. Do not post test messages into the channel. Watch `npx wrangler tail slack-bridge-example` for a `silent` log line and confirm there is no `wake ok` for that channel.
+4. Rollback the mute by clearing `SILENT_CHANNEL_IDS` and deploying. That restores acks and wakes for the channel.
+
+`node-http-relay` imports this module, so the same variable mutes there too. Socket Mode checks the variable at the start of `app_mention` and `message`, before thinking status. The live host is the Worker.
+
+This tree is `origin/main` plus this guard. It does not contain reported commits `a56ca24`, `3dcafa5`, or the deployed revision `2b1c4525`, and it has no Voltron or sticky-session path. Deploying it replaces the live Worker with this source. If production is running unpublished commits, cherry-pick this guard onto that source instead of rolling the service back.
+
 ## Honcho ingest (off by default)
 
 `HONCHO_INGEST` in `[vars]` defaults to `"0"`. Public-channel writes run inside `ctx.waitUntil` after the Worker has already built the `200` response. `wakeGrok` does not call Honcho. Ingest itself does not read.

@@ -49,6 +49,7 @@ import {
   mapLogPeer,
   botLabelSet,
   isSlackUserId,
+  isSilentEvent,
 } from "../cloudflare-relay/src/honcho.js";
 
 export function loadLogEntries(dir) {
@@ -172,6 +173,11 @@ export async function backfillLogs(opts = {}) {
   for (const row of entries) {
     if (row._bad) {
       bump(skipped, "bad-json");
+      continue;
+    }
+    // Muted channels are not public-ingested, even if the allowlist names them.
+    if (isSilentEvent(env, eventFromRow(row))) {
+      bump(skipped, "silent");
       continue;
     }
     const resolved = await resolveIngestChannel(eventFromRow(row), {

@@ -18,6 +18,11 @@
  * and forwardWatched await one session context and attach payload.honcho before
  * wakeGrok. A slow or failed read still wakes (honcho.ok === false). See src/honcho.js.
  *
+ * SILENT_CHANNEL_IDS (comma-separated) is a mute. Those channels get HTTP 200
+ * and nothing else: no reaction, thinking status, hold-ack, welcome, wake, or
+ * Honcho write. The check runs before ensureSelf and before route/handle.
+ * Listing a channel does not enable recording.
+ *
  * Acknowledgement is a reaction (ACK_REACTION, default white_check_mark). The text
  * hold-ack is opt-in (HOLD_ACK=true). Replies the Worker itself posts follow the
  * threading rule: plain in DMs/group DMs unless already threaded; thread +
@@ -27,7 +32,7 @@
  * 3-second deadline is never at risk.
  */
 
-import { fetchWakeContext, honchoReadEnabled, ingestIfEnabled } from "./honcho.js";
+import { eventChannelId, fetchWakeContext, honchoReadEnabled, ingestIfEnabled, isSilentEvent, silentChannelSet } from "./honcho.js";
 
 const enc = new TextEncoder();
 const FORWARD_SUBTYPES = new Set(["file_share", "slack_audio"]);
@@ -116,6 +121,7 @@ export function cfg(env) {
     mpimRequireAddress: isTrue(env.MPIM_REQUIRE_ADDRESS, false),
     watch: idSet(env.WATCH_CHANNEL_IDS),
     welcome: idSet(env.WELCOME_CHANNEL_IDS),
+    silent: silentChannelSet(env),
     welcomeText: env.WELCOME_TEXT || ":wave: Welcome, {user}! Ask me anything {ask_channel}, or @mention me in any channel I'm in.",
     askChannel: env.ASK_CHANNEL_ID || null,
     allowBotIds: idSet(env.ALLOW_BOT_IDS),
@@ -175,6 +181,8 @@ function worthForwarding(text, c) {
 /** Returns { action, reason }. action: wake_mention | wake_dm | watched | welcome | ignore */
 export function route(e, c) {
   if (!e || typeof e !== "object") return { action: "ignore", reason: "no-event" };
+  // Before mention, DM, watch, welcome, and join handling. Edits and joins included.
+  if (c.silent?.has(eventChannelId(e))) return { action: "ignore", reason: "silent" };
   const mentionsMe = !!c.ownUserId && String(e.text || "").includes(`<@${c.ownUserId}>`);
 
   if (e.type === "app_mention") {
@@ -222,7 +230,17 @@ export function dropRetry(reason, c) {
 }
 
 // ---------------------------------------------------------------- Slack Web API
+/** True when a Slack Web API body targets a muted channel. Blocks reads and writes. */
+export function silentSlackWriteBlocked(env, body) {
+  const channel = body && typeof body === "object" ? (body.channel || body.channel_id) : "";
+  return isSilentEvent(env, { channel });
+}
+
 async function slackApi(env, method, body, { get = false, quiet = false } = {}) {
+  if (silentSlackWriteBlocked(env, body)) {
+    log("silent channel blocked", method, body?.channel || body?.channel_id);
+    return { ok: false, error: "silent_channel" };
+  }
   const url = `https://slack.com/api/${method}`;
   const headers = { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` };
   let res;
@@ -267,6 +285,7 @@ async function resolveChannelType(env, e) {
 
 /** React to the message that just arrived. Custom emoji missing → white_check_mark. Missing scope is logged once per call. */
 async function addAckReaction(env, c, channel, ts) {
+  if (isSilentEvent(env, { channel })) return;
   if (!c.ackReaction || !channel || !ts) return;
   const name = c.ackReaction;
   const res = await slackApi(env, "reactions.add", { channel, timestamp: ts, name }, { quiet: true }).catch((err) => ({ ok: false, error: err?.message || "request_failed" }));
@@ -329,6 +348,11 @@ async function summarizeEvent(env, e) {
 }
 
 async function wakeGrok(env, payload) {
+  const channel = payload?.slack?.channel || payload?.channel;
+  if (isSilentEvent(env, { channel })) {
+    log("silent channel blocked wake", channel);
+    return "";
+  }
   const headers = { "Content-Type": "application/json" };
   if (env.GROK_WEBHOOK_SECRET) {
     headers["Authorization"] = `Bearer ${env.GROK_WEBHOOK_SECRET}`;
@@ -345,14 +369,19 @@ async function wakeGrok(env, payload) {
   return text;
 }
 
-const setThinking = (env, c, channel, threadTs) =>
-  slackApi(env, "assistant.threads.setStatus", {
+const setThinking = (env, c, channel, threadTs) => {
+  if (isSilentEvent(env, { channel })) return Promise.resolve();
+  return slackApi(env, "assistant.threads.setStatus", {
     channel_id: channel, thread_ts: threadTs, status: "is thinking…", loading_messages: c.loading,
   }).catch(() => {});
-const clearThinking = (env, channel, threadTs) =>
-  slackApi(env, "assistant.threads.setStatus", { channel_id: channel, thread_ts: threadTs, status: "" }).catch(() => {});
+};
+const clearThinking = (env, channel, threadTs) => {
+  if (isSilentEvent(env, { channel })) return Promise.resolve();
+  return slackApi(env, "assistant.threads.setStatus", { channel_id: channel, thread_ts: threadTs, status: "" }).catch(() => {});
+};
 
 async function postHoldAck(env, c, channel, fields, text) {
+  if (isSilentEvent(env, { channel })) return;
   if (!c.holdAck || !channel) return;
   if (c.holdAckSkip && c.holdAckSkip.test(String(text || ""))) return log("hold-ack skipped (HOLD_ACK_SKIP_REGEX)");
   const body = c.personalRe.test(String(text || "")) ? c.holdAckPersonal : c.holdAckGeneric;
@@ -375,6 +404,7 @@ async function honchoForWake(env, e) {
 }
 
 async function processInbound(env, c, kind, e, sayOnFail) {
+  if (isSilentEvent(env, e)) return;
   const channel = e.channel;
   const threadTs = e.thread_ts || e.ts;
   const placement = replyFields(e);
@@ -408,6 +438,7 @@ async function processInbound(env, c, kind, e, sayOnFail) {
 }
 
 async function forwardWatched(env, c, e) {
+  if (isSilentEvent(env, e)) return;
   try {
     const slack = await summarizeEvent(env, e);
     const payload = { source: c.source, kind: "channel_message", watched: true, slack, reply: replyFields(e) };
@@ -432,6 +463,7 @@ async function botCapReached(env, c, e) {
 }
 
 async function welcome(env, c, e) {
+  if (isSilentEvent(env, e)) return;
   const info = await resolveUser(env, e.user);
   if (info?.is_bot) return;
   if (e.ts) await slackApi(env, "reactions.add", { channel: e.channel, timestamp: e.ts, name: "wave" }).catch(() => {});
@@ -463,6 +495,7 @@ async function lookupIngestChannel(env, channel) {
 // Returns null when HONCHO_INGEST is off. Caller must only waitUntil the promise.
 // Missing channel_type: HONCHO_CHANNEL_IDS, else conversations.info, else skip.
 function scheduleHoncho(env, c, e) {
+  if (isSilentEvent(env, e)) return null;
   return ingestIfEnabled(env, e, {
     ownUserId: c.ownUserId,
     ownBotId: c.ownBotId,
@@ -477,6 +510,7 @@ function scheduleHoncho(env, c, e) {
 }
 
 async function handle(env, c, e, action) {
+  if (isSilentEvent(env, e)) return;
   if (action === "welcome") return welcome(env, c, e);
   if (action === "wake_mention" && await botCapReached(env, c, e)) {
     log("bot reply cap reached; ignoring", e.bot_id, e.channel, e.thread_ts);
@@ -514,6 +548,16 @@ export default {
     // Slack's one-time Request URL handshake (the reason a plain routine webhook can't be used).
     if (body.type === "url_verification") return json({ challenge: body.challenge });
     if (body.type !== "event_callback") return json({ ok: true, action: "ignore", reason: `type:${body.type}` });
+
+    // Mute before auth.test, ack, thinking, hold-ack, welcome, wake, or ingest.
+    // Covers app_mention (including edited), message, message_changed, joins,
+    // member_joined_channel, threads, and retries. HTTP 200 is the Slack
+    // protocol ack only. Recording stays off: this branch does not write Honcho.
+    if (isSilentEvent(env, body.event)) {
+      const e = body.event;
+      log("silent", body.event_id, e?.type, e?.subtype || "", eventChannelId(e), e?.ts || e?.message?.ts || "", e?.edited ? "edited" : "");
+      return json({ ok: true, action: "ignore", reason: "silent" }, 200, { "X-Relay-Action": "ignore:silent" });
+    }
 
     await ensureSelf(env);
     const c = cfg(env);

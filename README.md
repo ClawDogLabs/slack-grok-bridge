@@ -120,6 +120,10 @@ Bolt acks Socket Mode events when the listener Promise settles. This process:
 
 The reaction is the acknowledgement. It needs `reactions:write`. If that scope is missing, the bridge logs `reactions:write` and continues. If the configured emoji is not installed in the workspace, it logs that and retries with `white_check_mark`. Set `ACK_REACTION=off` to disable the reaction. Emoji names have no colons (`white_check_mark`, not `:white_check_mark:`).
 
+## Silent channels (mute only)
+
+`SILENT_CHANNEL_IDS` (comma-separated channel ids) drops every event in those channels before the reaction, the thinking status, the hold-ack, a welcome, a watched-channel wake, and Honcho. Slack still gets HTTP 200 from the Worker so it does not retry. The list does not enable recording. Do not copy those ids into `HONCHO_CHANNEL_IDS`. See [`cloudflare-relay/README.md`](cloudflare-relay/README.md#mute-a-channel-no-recording) for the deploy checklist, including `C0SYNTH0001`. `message.groups` and `groups:history` are not part of the mute. Recording stays off.
+
 The text hold-ack is **opt-in** (`HOLD_ACK=true`). Leave it off unless you also want a message. When it is on:
 - Generic: "Got it - checking with the owner and will get back to you."
 - Personal/family heuristic (kids, schedule, school, address, etc.): "That's not on my approved list of things to share publicly. Let me check with the owner and get back to you."

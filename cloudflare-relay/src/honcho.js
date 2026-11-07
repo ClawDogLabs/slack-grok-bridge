@@ -58,7 +58,7 @@ const FINANCE_RES = [
 
 const HUMAN_SUBTYPES = new Set(["file_share", "slack_audio", "thread_broadcast", "me_message"]);
 const OWN_SUBTYPES = new Set([...HUMAN_SUBTYPES, "bot_message"]);
-const LOUD_SKIP = new Set(["personal", "secret", "address", "finance", "needs-channel-type", "not-allowlisted"]);
+const LOUD_SKIP = new Set(["personal", "secret", "address", "finance", "needs-channel-type", "not-allowlisted", "silent"]);
 const SLACK_USER_ID = /^[UW][A-Z0-9]+$/;
 const lookupCache = new Map();
 
@@ -117,6 +117,43 @@ export function parseChannelIds(value) {
   if (value instanceof Set) return value.size ? value : null;
   const ids = String(value).split(",").map((s) => s.trim()).filter(Boolean);
   return ids.length ? new Set(ids) : null;
+}
+
+/**
+ * Channels that must stay silent. Accepts the Worker env or the raw
+ * SILENT_CHANNEL_IDS string. Empty / unset means no mute. This list does not
+ * enable recording.
+ */
+export function silentChannelSet(source) {
+  const value = source instanceof Set || typeof source === "string" || source == null
+    ? source
+    : source.SILENT_CHANNEL_IDS;
+  return parseChannelIds(value) || new Set();
+}
+
+/** Slack channel id from a top-level event, an edit, a join, or a raw id string. */
+export function eventChannelId(event) {
+  if (typeof event === "string") return event.trim();
+  if (!event || typeof event !== "object") return "";
+  const values = [
+    event.channel,
+    event.channel_id,
+    event.message?.channel,
+    event.item?.channel,
+    event.previous_message?.channel,
+  ];
+  for (const value of values) {
+    const id = String(value ?? "").trim();
+    if (id) return id;
+  }
+  return "";
+}
+
+/** True when the event's channel is listed in SILENT_CHANNEL_IDS. */
+export function isSilentEvent(env, event) {
+  const id = eventChannelId(event);
+  if (!id) return false;
+  return silentChannelSet(env).has(id);
 }
 
 export function isSlackUserId(value) {
@@ -448,6 +485,9 @@ function startWrite(env, event, opts) {
  */
 export function ingestIfEnabled(env, event, opts = {}) {
   if (!honchoIngestEnabled(env)) return null;
+  // Silent channels are not public-ingested. Recording is a separate path and
+  // stays off until that path is explicitly enabled. Never fall through.
+  if (isSilentEvent(env, event)) return logSkip("silent", event, opts);
   const allowlist = opts.allowlist !== undefined ? opts.allowlist : env?.HONCHO_CHANNEL_IDS;
   let sync;
   try {
