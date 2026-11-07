@@ -41,6 +41,23 @@ ASK_CHANNEL_ID = ""                   # channel referenced as {ask_channel} in W
 WELCOME_TEXT = ""                     # placeholders {user} and {ask_channel}; a generic default is used if empty
 RETRY_POLICY = "drop_timeouts"        # drop_timeouts | drop_all | process_all (see README)
 
+# Mute. Comma-separated channel ids. HTTP 200 and nothing else: no reaction
+# (including a custom ack emoji), no thinking status, no hold-ack, no welcome,
+# no Grok wake, no Honcho write. Edits, joins, threads, and retries included.
+# Does not enable recording. Do not also list these ids in HONCHO_CHANNEL_IDS.
+SILENT_CHANNEL_IDS = ""
+# Isolated record for SILENT_CHANNEL_IDS only. Default off. Do not set "1" until
+# the mute is deployed from the runtime source, message.groups and groups:history
+# are verified, and a tail shows honcho record ok (not a public peer id).
+SILENT_RECORD = "0"
+# Who may run an explicit history search in a 1:1 DM. Not attached to wakes.
+# Format: CHANNEL:USER|USER,CHANNEL2:USER  (pipe inside a channel, comma between channels)
+SILENT_CHANNEL_READERS = ""
+# Names that count as naming the channel in that search. Same CHANNEL:alias|alias shape.
+SILENT_CHANNEL_ALIASES = ""
+# Slack user ids allowed to call the owner-Grok scoped read. Empty = nobody.
+SILENT_GROK_READER_IDS = ""
+
 # Honcho phase A. Default off. "1" writes public-channel messages after the Slack ack.
 # DMs, group DMs, and private channels are not written. Ingest does not read Honcho.
 HONCHO_INGEST = "0"
@@ -53,6 +70,24 @@ HONCHO_CHANNEL_IDS = ""
 # When "1", processInbound/forwardWatched await session context and attach payload.honcho.
 HONCHO_READ = "0"
 HONCHO_READ_TIMEOUT_MS = "1500"
+HONCHO_READ_TOKENS = "3000"
+# Private-room attach map. Unset uses placeholder sessions that match no real channel.
+# Set this in untracked runtime config. "{}" attaches no private sessions.
+# Example shape only:
+# HONCHO_PRIVATE_SESSIONS = '{"archive-private":{"channels":["CPLACEHOLDER1"],"key":"archive"},"privroom-playbooks":{"channels":["CPLACEHOLDER1"],"key":"playbooks","peer":false}}'
+HONCHO_ARCHIVE_SESSION = "archive-private"
+HONCHO_PLAYBOOKS_SESSION = "privroom-playbooks"
+HONCHO_ARCHIVE_CHANNEL_IDS = "CPLACEHOLDER1"
+# Sticky threads need a KV binding named PRIVROOM_STATE. "0" disables.
+# A sole @mention, or a root message from this bot, owns the thread for 7 days.
+# A reply inside an existing thread does not. Untagged human replies wake.
+# Messages from bots do not. Muted channels never claim or wake.
+STICKY_THREADS = "1"
+# Private-room synthesize needs PRIVROOM_STATE and a queue binding PRIVROOM_SYNTH.
+# Bot roster is required for synthesize matching. Unset matches nobody. "0" disables.
+PRIVROOM_SYNTHESIZE = "1"
+# PRIVROOM_BOTS = '[{"name":"BotA","userId":"UPLACEHOLDER2","botId":"BPLACEHOLDER1"}]'
+PRIVROOM_DELAY_SECONDS = "300"
 
 # Secrets (set with `npx wrangler secret put NAME`, never in this file):
 #   SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, GROK_WEBHOOK_URL, GROK_WEBHOOK_SECRET,

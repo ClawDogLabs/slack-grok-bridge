@@ -318,7 +318,7 @@ test("backfill does not treat bare C ids as public and maps samplebot to OWN_USE
   };
   const classified = await backfillLogs({
     entries,
-    env: { SLACK_BOT_TOKEN: "xoxb-test", OWN_USER_ID: "UBOTSAMPLE", HONCHO_INGEST: "0" },
+    env: { SLACK_BOT_TOKEN: "xoxb-test", OWN_USER_ID: "UBOTSAMPLE", BOT_NAME: "samplebot", HONCHO_INGEST: "0" },
     fetchImpl,
   });
   assert.equal(classified.dryRun, true);
@@ -333,7 +333,7 @@ test("backfill does not treat bare C ids as public and maps samplebot to OWN_USE
   let slackCalls = 0;
   const allowlisted = await backfillLogs({
     entries,
-    env: { HONCHO_CHANNEL_IDS: "CPUB", OWN_USER_ID: "UBOTSAMPLE", HONCHO_INGEST: "0", SLACK_BOT_TOKEN: "xoxb-test" },
+    env: { HONCHO_CHANNEL_IDS: "CPUB", OWN_USER_ID: "UBOTSAMPLE", BOT_NAME: "samplebot", HONCHO_INGEST: "0", SLACK_BOT_TOKEN: "xoxb-test" },
     fetchImpl: async (url) => {
       if (String(url).includes("slack.com")) slackCalls += 1;
       return slackJson({ ok: false, error: "missing_scope" });
