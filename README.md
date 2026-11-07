@@ -122,7 +122,9 @@ The reaction is the acknowledgement. It needs `reactions:write`. If that scope i
 
 ## Silent channels (mute only)
 
-`SILENT_CHANNEL_IDS` (comma-separated channel ids) drops every event in those channels before the reaction, the thinking status, the hold-ack, a welcome, a watched-channel wake, and Honcho. Slack still gets HTTP 200 from the Worker so it does not retry. The list does not enable recording. Do not copy those ids into `HONCHO_CHANNEL_IDS`. See [`cloudflare-relay/README.md`](cloudflare-relay/README.md#mute-a-channel-no-recording) for the deploy checklist, including `C0SYNTH0001`. `message.groups` and `groups:history` are not part of the mute. Recording stays off.
+`SILENT_CHANNEL_IDS` (comma-separated channel ids) drops every event in those channels before the reaction, the thinking status, the hold-ack, a welcome, a watched-channel wake, and public Honcho. Slack still gets HTTP 200 from the Worker so it does not retry. The list does not enable recording. Do not copy those ids into `HONCHO_CHANNEL_IDS`. See [`cloudflare-relay/README.md`](cloudflare-relay/README.md#mute-a-channel-no-recording). Real channel ids belong only in untracked runtime config. `message.groups` and `groups:history` are not part of the mute.
+
+`SILENT_RECORD` (default off) is a separate switch. When it is on, muted channels are stored in an isolated Honcho session (`record-<channel>`) under peer ids `rec-<channel>-<user>`, not the Slack user id, with reasoning, summaries, dreams, and peer cards disabled. That session is never attached to a Slack wake. Readers listed in config can ask for it only with an explicit history search in a 1:1 DM. Catch-up from the local log is `--record-only --channel ... --since <creation ts>` after a live `honcho record ok`, and it does not import other channels. Details are in the relay README. Do not `wrangler deploy` this git tree over a Worker built from unpublished commits.
 
 The text hold-ack is **opt-in** (`HOLD_ACK=true`). Leave it off unless you also want a message. When it is on:
 - Generic: "Got it - checking with the owner and will get back to you."

@@ -166,6 +166,43 @@ Deploy the mute (do this only when you intend to ship; this repo does not deploy
 
 This tree is `origin/main` plus this guard. It does not contain reported commits `a56ca24`, `3dcafa5`, or the deployed revision `2b1c4525`, and it has no Voltron or sticky-session path. Deploying it replaces the live Worker with this source. If production is running unpublished commits, cherry-pick this guard onto that source instead of rolling the service back.
 
+## Private record (off by default)
+
+`SILENT_RECORD` defaults to `"0"`. Leave it off until the mute is what the live Worker is running, `message.groups` is subscribed, the bot token has `groups:history`, and you have watched one new message log `honcho record ok` without a Slack reaction. Mentions already arrive as `app_mention`. Ordinary private-channel messages do not arrive until those two Slack settings are verified. This repo does not change the Slack app.
+
+When the switch is on, a muted channel is written to the **same** Honcho workspace (no second workspace) as session `record-<channelId>` and peer `rec-<channelId>-<slackUserId>`. The Slack user id is metadata for the owner view, not the Honcho peer id. The public session `channel-<id>` is not used. Setup sends session configuration `reasoning.enabled`, `summary.enabled`, `dream.enabled` false and `peer_card.create` / `use` false, session-peer `observe_me` and `observe_others` false, and message `reasoning.enabled` false. Honcho v3.6 documents message config as the highest layer and `observe_me` defaulting to true; the deriver skips a representation only when the effective flag is false, and summaries are a separate queue, which is why summary is disabled explicitly. The session PUT and the peer-config PUT must succeed or the message is not posted, and the code does not fall back to public ingest. Wake reads (`HONCHO_READ`) return `silent` and do not fetch `record-<id>`.
+
+That does not prove the hosted service has no other workspace-wide reader. Do not enable the switch until that limit is accepted.
+
+### Explicit lookup only
+
+Nothing in a wake payload, including an owner DM that does not ask, includes this session. A search has to name the channel (its id or `SILENT_CHANNEL_ALIASES`) and use history language (`search`, `history`, `what was said`, …). The Worker checks Slack's `user` and `channel_type: im` on a `D…` channel. Text that claims a name is ignored. Readers are `SILENT_CHANNEL_READERS` (`CHANNEL:USER|USER`). Example only — these ids are synthetic. Real ids stay in untracked runtime config:
+
+```toml
+SILENT_CHANNEL_IDS = "C0SYNTH0001"
+SILENT_RECORD = "0"   # set "1" only after the checks above
+SILENT_CHANNEL_ALIASES = "C0SYNTH0001:record-room|record room"
+SILENT_CHANNEL_READERS = "C0SYNTH0001:U0SYNTH0001|U0SYNTH0002|U0SYNTH0003|U0SYNTH0004"
+SILENT_GROK_READER_IDS = "U0SYNTH0001"
+```
+
+An allowed 1:1 DM gets one `chat.postMessage` back in that DM (no broadcast, no reaction, no wake). Other surfaces get nothing from this store. The configured owner's private Grok chat can call `queryRecordSession(env, { source: "owner-grok", requesterId, channelId })`, which returns session messages and null peer fields. Do not expose that function on HTTP. Render it only in that chat.
+
+### Catch-up since channel creation
+
+Honcho stays empty for this channel until `SILENT_RECORD` is on. Messages already in `log/raw/*.jsonl` are not a Honcho backlog. After one live `honcho record ok`, and only then, replay **this channel** from its creation timestamp. `--since` is required. Other channels in the same files are skipped. A plain `--write` refuses muted ids and must not be used for this.
+
+```bash
+node --env-file=.env scripts/honcho-backfill.mjs --record-only \
+  --channel C0SYNTH0001 --since <creation slack ts> --dir log/raw
+node --env-file=.env scripts/honcho-backfill.mjs --record-only --write \
+  --channel C0SYNTH0001 --since <creation slack ts> --dir log/raw
+```
+
+Dry-run prints `peer_id` values that start with `rec-` and `session_id` `record-C0SYNTH0001`. If a line shows a raw `U…` peer id, do not pass `--write`. This is not a full-history import.
+
+Deploy this the same way as the mute: cherry-pick onto the source that matches the running Worker (`2b1c4525` is not in this repo). Do not `wrangler deploy` this git tree over that script.
+
 ## Honcho ingest (off by default)
 
 `HONCHO_INGEST` in `[vars]` defaults to `"0"`. Public-channel writes run inside `ctx.waitUntil` after the Worker has already built the `200` response. `wakeGrok` does not call Honcho. Ingest itself does not read.

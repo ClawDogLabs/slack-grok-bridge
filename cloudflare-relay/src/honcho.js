@@ -71,6 +71,7 @@ export function createHonchoState() {
     sessions: new Set(),
     members: new Set(),
     seen: new Map(),
+    recordReady: new Set(),
   };
 }
 
@@ -82,6 +83,7 @@ export function resetHonchoState() {
   globalState.sessions.clear();
   globalState.members.clear();
   globalState.seen.clear();
+  globalState.recordReady = new Set();
   lookupCache.clear();
 }
 
@@ -380,19 +382,21 @@ function unclaim(state, channel, ts) {
   state.seen.delete(`${channel}:${ts}`);
 }
 
-async function honchoPost(env, path, body, fetchImpl) {
+async function honchoPost(env, path, body, fetchImpl, method = "POST") {
   const key = env?.HONCHO_API_KEY;
   if (!key) throw new Error("honcho missing HONCHO_API_KEY");
   const base = String(env.HONCHO_API_BASE || HONCHO_BASE).replace(/\/$/, "");
-  const res = await fetchImpl(`${base}${path}`, {
-    method: "POST",
+  const init = {
+    method,
     headers: {
       Authorization: `Bearer ${key}`,
       "Content-Type": "application/json",
+      Accept: "application/json",
     },
-    body: JSON.stringify(body),
     signal: AbortSignal.timeout(15000),
-  });
+  };
+  if (body !== undefined && body !== null) init.body = JSON.stringify(body);
+  const res = await fetchImpl(`${base}${path}`, init);
   if (!res.ok && res.status !== 409) throw new Error(`honcho ${res.status} ${path}`);
   return res;
 }
@@ -619,6 +623,8 @@ export async function fetchWakeContext(env, { channel, user, text, channelType }
     if (!key) return done({ ok: false, error: "no-key" });
     const channelId = String(channel || "").trim();
     if (!channelId || !ID_RE.test(channelId)) return done({ ok: false, error: "bad-channel" });
+    // Record-only sessions are never wake context. Do not name or fetch them here.
+    if (isSilentEvent(env, { channel: channelId })) return done({ ok: false, error: "silent" });
     const ws = workspaceIdOf(env);
     if (!ID_RE.test(ws)) return done({ ok: false, error: "bad-workspace" });
     const sessionId = sessionIdForChannel(channelId);
@@ -640,4 +646,382 @@ export async function fetchWakeContext(env, { channel, user, text, channelType }
   } catch (err) {
     return done({ ok: false, error: errorFromCatch(err) });
   }
+}
+
+/**
+ * Record-only storage for SILENT_CHANNEL_IDS.
+ *
+ * Off unless SILENT_RECORD is on. Never uses the public session `channel-<id>`
+ * or the Slack user id as the Honcho peer id, so shared peer cards are not the
+ * observed peer. Same workspace (no second workspace). No scopes.
+ *
+ * Honcho v3.6 (api.honcho.dev, deriver enqueue.py get_effective_observe_me):
+ * - observe_me defaults to true. Session peer config overrides peer config.
+ *   false means the deriver does not enqueue a representation for that sender.
+ *   Summaries are enqueued separately and do not check observe_me.
+ * - Message configuration is the highest layer. reasoning.enabled false skips
+ *   reasoning for that message. Message config cannot disable summaries.
+ * - Session reasoning.enabled false disables facts, representations, peer cards,
+ *   and dreams. summary.enabled is independent, so it is set false here.
+ * - POST get-or-create may return an existing session without applying new
+ *   configuration, so the session PUT and the session-peer config PUT must
+ *   succeed before the message POST. A failed setup does not fall through to
+ *   sendIngest.
+ *
+ * Residual limit: this client cannot prove the hosted service has no other
+ * workspace-wide reader. Flags plus a distinct peer id are what the API
+ * actually exposes. Wake reads never request `record-<id>`.
+ */
+
+export const RECORD_SESSION_CONFIGURATION = Object.freeze({
+  reasoning: Object.freeze({ enabled: false }),
+  summary: Object.freeze({ enabled: false }),
+  dream: Object.freeze({ enabled: false }),
+  peer_card: Object.freeze({ create: false, use: false }),
+});
+export const RECORD_MESSAGE_CONFIGURATION = Object.freeze({
+  reasoning: Object.freeze({ enabled: false }),
+});
+const RECORD_OBSERVE = Object.freeze({ observe_me: false, observe_others: false });
+
+const SEARCH_INTENT_RE = /\b(search|history|transcript|recall|look[\s-]*up|what was said|what did\b|recorded|recording|messages from|channel log)\b/i;
+
+export function silentRecordEnabled(env) {
+  const v = env?.SILENT_RECORD;
+  if (v === undefined || v === null || String(v).trim() === "") return false;
+  const s = String(v).trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "on";
+}
+
+export function recordSessionIdForChannel(channelId) {
+  return `record-${channelId}`;
+}
+
+export function recordPeerId(channelId, slackUserId) {
+  return `rec-${channelId}-${slackUserId}`;
+}
+
+export function normalizeRecordEvent(event) {
+  if (!event || typeof event !== "object") return event;
+  if (event.subtype === "message_changed" && event.message && typeof event.message === "object") {
+    const inner = event.message;
+    const subtype = inner.subtype && inner.subtype !== "message_changed" ? inner.subtype : undefined;
+    return {
+      type: inner.type || "message",
+      user: inner.user,
+      bot_id: inner.bot_id,
+      subtype,
+      text: inner.text,
+      ts: inner.ts || event.ts,
+      thread_ts: inner.thread_ts || null,
+      channel: inner.channel || event.channel || event.channel_id,
+      channel_type: inner.channel_type || event.channel_type,
+    };
+  }
+  return event;
+}
+
+/** Sync gate for record-only writes. Does not apply the public personal-term filter. */
+export function decideRecordIngest(event, opts = {}) {
+  const env = opts.env || opts;
+  const raw = normalizeRecordEvent(event);
+  if (!raw || typeof raw !== "object") return { ok: false, reason: "no-event" };
+  const channel = eventChannelId(raw);
+  if (!isSilentEvent(env, { channel })) return { ok: false, reason: "not-silent" };
+  const ct = raw.channel_type;
+  if (ct === "im" || ct === "mpim" || channel.startsWith("D")) return { ok: false, reason: "not-record-channel" };
+  if (raw.type && raw.type !== "message" && raw.type !== "app_mention") return { ok: false, reason: "type" };
+  if (raw.hidden) return { ok: false, reason: "hidden" };
+  if (raw.bot_id || raw.subtype === "bot_message") return { ok: false, reason: "bot" };
+  if (raw.subtype && !HUMAN_SUBTYPES.has(raw.subtype)) return { ok: false, reason: "subtype" };
+  const text = String(raw.text || "").trim();
+  if (!text) return { ok: false, reason: "empty" };
+  const sensitive = sensitiveReason(text);
+  if (sensitive) return { ok: false, reason: sensitive };
+  const slackUserId = String(raw.user || "").trim();
+  if (!isSlackUserId(slackUserId)) return { ok: false, reason: "no-peer" };
+  if (!raw.ts) return { ok: false, reason: "no-ts" };
+  const peerId = recordPeerId(channel, slackUserId);
+  const sessionId = recordSessionIdForChannel(channel);
+  if (!ID_RE.test(peerId) || !ID_RE.test(sessionId)) return { ok: false, reason: "bad-id" };
+  if (peerId === slackUserId || sessionId === sessionIdForChannel(channel) || sessionId.startsWith("channel-")) {
+    return { ok: false, reason: "isolation" };
+  }
+  return {
+    ok: true,
+    peerId,
+    slackUserId,
+    channel,
+    sessionId,
+    text,
+    ts: String(raw.ts),
+    threadTs: raw.thread_ts || null,
+    subtype: raw.subtype || null,
+    own: false,
+  };
+}
+
+async function assertRecordIsolation(prepared) {
+  if (!prepared?.peerId || prepared.peerId === prepared.slackUserId) {
+    throw new Error("honcho refused shared peer");
+  }
+  if (!prepared.sessionId || !prepared.sessionId.startsWith("record-") || prepared.sessionId.startsWith("channel-")) {
+    throw new Error("honcho refused wake session");
+  }
+}
+
+/** Isolated write. Throws before the message POST if setup does not stick. */
+export async function sendRecord(env, prepared, opts = {}) {
+  await assertRecordIsolation(prepared);
+  const fetchImpl = opts.fetchImpl || globalThis.fetch;
+  const state = stateOf(opts);
+  if (!state.recordReady) state.recordReady = new Set();
+  const ws = workspaceIdOf(env);
+  if (!ID_RE.test(ws)) throw new Error("honcho bad workspace id");
+  if (state.workspace !== ws) {
+    await honchoPost(env, "/v3/workspaces", { id: ws }, fetchImpl);
+    state.workspace = ws;
+  }
+  const readyKey = `${prepared.sessionId}:${prepared.peerId}`;
+  if (!state.recordReady.has(readyKey)) {
+    await honchoPost(env, `/v3/workspaces/${encodeURIComponent(ws)}/peers`, {
+      id: prepared.peerId,
+      configuration: { observe_me: false },
+    }, fetchImpl);
+    await honchoPost(env, `/v3/workspaces/${encodeURIComponent(ws)}/sessions`, {
+      id: prepared.sessionId,
+      metadata: { channel: prepared.channel, source: "slack-record", isolation: "record-session" },
+      configuration: RECORD_SESSION_CONFIGURATION,
+      peers: { [prepared.peerId]: RECORD_OBSERVE },
+    }, fetchImpl);
+    const sessionPath = `/v3/workspaces/${encodeURIComponent(ws)}/sessions/${encodeURIComponent(prepared.sessionId)}`;
+    await honchoPost(env, sessionPath, { configuration: RECORD_SESSION_CONFIGURATION }, fetchImpl, "PUT");
+    await honchoPost(
+      env,
+      `${sessionPath}/peers/${encodeURIComponent(prepared.peerId)}/config`,
+      RECORD_OBSERVE,
+      fetchImpl,
+      "PUT",
+    );
+    state.recordReady.add(readyKey);
+  }
+  const message = {
+    content: prepared.content,
+    peer_id: prepared.peerId,
+    metadata: prepared.metadata,
+    configuration: RECORD_MESSAGE_CONFIGURATION,
+  };
+  if (prepared.createdAt) message.created_at = prepared.createdAt;
+  await honchoPost(
+    env,
+    `/v3/workspaces/${encodeURIComponent(ws)}/sessions/${encodeURIComponent(prepared.sessionId)}/messages`,
+    { messages: [message] },
+    fetchImpl,
+  );
+}
+
+/**
+ * Record-only ingest. Null unless SILENT_RECORD is on and the channel is muted.
+ * Never calls sendIngest. Failures do not reject.
+ */
+export function ingestSilentIfEnabled(env, event, opts = {}) {
+  if (!silentRecordEnabled(env)) return null;
+  if (!isSilentEvent(env, event)) return null;
+  let decision;
+  try {
+    decision = decideRecordIngest(event, { env });
+  } catch (err) {
+    (opts.log || console.log)("honcho record failed", err?.message || err);
+    return null;
+  }
+  if (!decision.ok) return logSkip(decision.reason, event, opts);
+  const state = stateOf(opts);
+  if (!claim(state, decision.channel, decision.ts)) return null;
+  const logFn = opts.log || console.log;
+  return materialize({ ...decision, peerId: decision.slackUserId }, opts)
+    .then((prepared) => {
+      prepared.peerId = decision.peerId;
+      prepared.slackUserId = decision.slackUserId;
+      prepared.sessionId = decision.sessionId;
+      prepared.metadata = {
+        ...prepared.metadata,
+        source: "slack-record",
+        slack_user: decision.slackUserId,
+        isolation: "record-session",
+      };
+      return sendRecord(env, prepared, opts);
+    })
+    .then(() => {
+      logFn("honcho record ok", decision.channel, decision.ts);
+    })
+    .catch((err) => {
+      unclaim(state, decision.channel, decision.ts);
+      if (state.recordReady) state.recordReady.delete(`${decision.sessionId}:${decision.peerId}`);
+      logFn("honcho record failed", err?.message || err, decision.channel, decision.ts);
+    });
+}
+
+function parseScopedMap(value) {
+  const map = new Map();
+  for (const part of String(value || "").split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const idx = trimmed.indexOf(":");
+    if (idx < 0) continue;
+    const id = trimmed.slice(0, idx).trim();
+    const members = trimmed.slice(idx + 1).split("|").map((s) => s.trim()).filter(Boolean);
+    if (id) map.set(id, new Set(members));
+  }
+  return map;
+}
+
+function aliasMap(env) {
+  return parseScopedMap(env?.SILENT_CHANNEL_ALIASES);
+}
+
+function readerMap(env) {
+  return parseScopedMap(env?.SILENT_CHANNEL_READERS);
+}
+
+function grokReaders(env) {
+  return parseChannelIds(env?.SILENT_GROK_READER_IDS) || new Set();
+}
+
+/** Channel ids from SILENT_CHANNEL_IDS whose id or configured alias appears in text. */
+export function namedSilentChannels(env, text) {
+  const hay = String(text || "");
+  const lower = hay.toLowerCase();
+  const aliases = aliasMap(env);
+  const found = [];
+  for (const channelId of silentChannelSet(env)) {
+    const names = [channelId, ...(aliases.get(channelId) || [])];
+    const hit = names.some((name) => {
+      const needle = String(name || "").trim().toLowerCase().replace(/^#/, "");
+      return needle && lower.includes(needle);
+    });
+    if (hit) found.push(channelId);
+  }
+  return found;
+}
+
+/**
+ * Explicit record search. kind "none" is not a search.
+ * kind "allow" is a 1:1 DM from a configured reader naming one muted channel.
+ * Anything else that names a channel with search intent is "deny" (no fetch).
+ * The Slack user id is event.user, never a name typed in the text.
+ */
+export function classifyRecordSearch(env, event) {
+  const text = String(event?.text || "");
+  if (!SEARCH_INTENT_RE.test(text)) return { kind: "none" };
+  const named = namedSilentChannels(env, text);
+  if (!named.length) return { kind: "none" };
+  if (named.length !== 1) return { kind: "deny", channelId: null };
+  const channelId = named[0];
+  const im = event?.channel_type === "im" && String(event?.channel || "").startsWith("D");
+  const human = !!event && !event.bot_id && event.subtype !== "bot_message";
+  const readers = readerMap(env).get(channelId) || new Set();
+  const requesterId = String(event?.user || "");
+  if (im && human && readers.has(requesterId)) {
+    return { kind: "allow", channelId, requesterId, dmChannel: String(event.channel) };
+  }
+  return { kind: "deny", channelId, requesterId };
+}
+
+function emptyRecord(extra) {
+  return {
+    ok: false,
+    messages: [],
+    peer_representation: null,
+    peer_card: null,
+    summary: null,
+    ...extra,
+  };
+}
+
+function recordMessageView(item) {
+  const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  return {
+    content: truncateLine(item?.content, 400),
+    author: metadata.author_display || metadata.slack_user || null,
+    slack_user: metadata.slack_user || null,
+    slack_ts: metadata.slack_ts || null,
+    created_at: item?.created_at || null,
+  };
+}
+
+/**
+ * Session message list only. Does not call /context, /chat, or peer dialectic.
+ * source "slack-im" re-checks the Slack event. source "owner-grok" allows only
+ * SILENT_GROK_READER_IDS and does not post to Slack.
+ */
+export async function queryRecordSession(env, opts = {}) {
+  const source = opts.source;
+  let channelId = String(opts.channelId || "").trim();
+  let requesterId = String(opts.requesterId || "").trim();
+  if (source === "slack-im") {
+    const decision = classifyRecordSearch(env, opts.event);
+    if (decision.kind !== "allow") return emptyRecord({ error: "forbidden" });
+    channelId = decision.channelId;
+    requesterId = decision.requesterId;
+  } else if (source === "owner-grok") {
+    if (!requesterId || !grokReaders(env).has(requesterId)) return emptyRecord({ error: "forbidden" });
+    if (!channelId || !isSilentEvent(env, { channel: channelId })) return emptyRecord({ error: "forbidden" });
+  } else {
+    return emptyRecord({ error: "forbidden" });
+  }
+  const sessionId = recordSessionIdForChannel(channelId);
+  if (!sessionId.startsWith("record-") || sessionId.startsWith("channel-")) return emptyRecord({ error: "isolation" });
+  const key = env?.HONCHO_API_KEY;
+  if (!key) return emptyRecord({ error: "no-key", channelId, sessionId, requesterId });
+  const ws = workspaceIdOf(env);
+  if (!ID_RE.test(ws) || !ID_RE.test(sessionId)) return emptyRecord({ error: "bad-id", channelId, sessionId });
+  try {
+    const fetchImpl = opts.fetchImpl || globalThis.fetch;
+    const base = String(env.HONCHO_API_BASE || HONCHO_BASE).replace(/\/$/, "");
+    const path = `/v3/workspaces/${encodeURIComponent(ws)}/sessions/${encodeURIComponent(sessionId)}/messages/list?reverse=true`;
+    const res = await fetchImpl(`${base}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: "{}",
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.status === 404) {
+      return { ok: true, channelId, sessionId, requesterId, messages: [], peer_representation: null, peer_card: null, summary: null };
+    }
+    if (!res.ok) return emptyRecord({ error: `http-${res.status}`, channelId, sessionId, requesterId });
+    const data = await res.json().catch(() => null);
+    const items = Array.isArray(data) ? data : (data?.items || data?.messages || []);
+    const views = (Array.isArray(items) ? items : []).map(recordMessageView).filter((m) => m.content);
+    views.sort((a, b) => Number(a.slack_ts || 0) - Number(b.slack_ts || 0));
+    return {
+      ok: true,
+      channelId,
+      sessionId,
+      requesterId,
+      messages: views.slice(-20),
+      peer_representation: null,
+      peer_card: null,
+      summary: null,
+    };
+  } catch (err) {
+    return emptyRecord({ error: errorFromCatch(err), channelId, sessionId, requesterId });
+  }
+}
+
+/** Owner-facing text. Ignores peer representation fields if a caller left them on. */
+export function formatRecordReply(result, { label } = {}) {
+  const name = label || result?.channelId || "that channel";
+  if (!result?.ok) return `I couldn't read the private history for ${name}.`;
+  const lines = Array.isArray(result.messages) ? result.messages : [];
+  if (!lines.length) return `No recorded messages for ${name} yet.`;
+  const body = lines.map((m) => {
+    const who = m.author || "someone";
+    const when = m.slack_ts ? `${m.slack_ts} ` : "";
+    return `• ${when}${who}: ${m.content}`;
+  }).join("\n");
+  return `Private history for ${name} (${lines.length} latest, this session only).\n${body}`;
 }

@@ -46,6 +46,17 @@ RETRY_POLICY = "drop_timeouts"        # drop_timeouts | drop_all | process_all (
 # no Grok wake, no Honcho write. Edits, joins, threads, and retries included.
 # Does not enable recording. Do not also list these ids in HONCHO_CHANNEL_IDS.
 SILENT_CHANNEL_IDS = ""
+# Isolated record for SILENT_CHANNEL_IDS only. Default off. Do not set "1" until
+# the mute is deployed from the runtime source, message.groups and groups:history
+# are verified, and a tail shows honcho record ok (not a public peer id).
+SILENT_RECORD = "0"
+# Who may run an explicit history search in a 1:1 DM. Not attached to wakes.
+# Format: CHANNEL:USER|USER,CHANNEL2:USER  (pipe inside a channel, comma between channels)
+SILENT_CHANNEL_READERS = ""
+# Names that count as naming the channel in that search. Same CHANNEL:alias|alias shape.
+SILENT_CHANNEL_ALIASES = ""
+# Slack user ids allowed to call the owner-Grok scoped read. Empty = nobody.
+SILENT_GROK_READER_IDS = ""
 
 # Honcho phase A. Default off. "1" writes public-channel messages after the Slack ack.
 # DMs, group DMs, and private channels are not written. Ingest does not read Honcho.

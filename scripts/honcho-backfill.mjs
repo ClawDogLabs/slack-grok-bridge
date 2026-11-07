@@ -40,8 +40,10 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   decideIngest,
+  decideRecordIngest,
   materialize,
   sendIngest,
+  sendRecord,
   buildPersonalRe,
   createHonchoState,
   resolveIngestChannel,
@@ -146,7 +148,72 @@ async function peerForRow(row, env, fetchImpl, box) {
  * @param {{ dir?: string, entries?: object[], dryRun?: boolean, write?: boolean, env?: object, fetchImpl?: Function, ownUserId?: string, ownBotId?: string, channelIds?: string }} opts
  * channelIds overrides HONCHO_CHANNEL_IDS for this run when provided.
  */
+function tsNum(ts) {
+  const n = Number(ts);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Isolated catch-up for one muted channel, ts >= since. Never calls sendIngest. */
+async function backfillRecordOnly(opts) {
+  const env = opts.env || process.env;
+  const channel = String(opts.channel || "").trim();
+  const since = tsNum(opts.since);
+  if (!channel) throw new Error("record-only requires --channel");
+  if (since === null) throw new Error("record-only requires --since");
+  if (!isSilentEvent(env, { channel })) throw new Error("record-only channel is not in SILENT_CHANNEL_IDS");
+  const dryRun = !opts.write;
+  const entries = opts.entries || loadLogEntries(opts.dir || "log/raw");
+  const skipped = {};
+  const accepted = [];
+  const seen = new Set();
+  const state = createHonchoState();
+  for (const row of entries) {
+    if (row._bad) {
+      bump(skipped, "bad-json");
+      continue;
+    }
+    if (String(row.channel || "") !== channel) {
+      bump(skipped, "other-channel");
+      continue;
+    }
+    const n = tsNum(row.ts);
+    if (n === null || n < since) {
+      bump(skipped, "before-since");
+      continue;
+    }
+    const decision = decideRecordIngest(eventFromRow(row), { env });
+    if (!decision.ok) {
+      bump(skipped, decision.reason);
+      continue;
+    }
+    const key = `${decision.channel}:${decision.ts}`;
+    if (seen.has(key)) {
+      bump(skipped, "duplicate");
+      continue;
+    }
+    seen.add(key);
+    const displayName = row.user_display_name || row.display_name || null;
+    const prepared = await materialize({ ...decision, peerId: decision.slackUserId }, { displayName });
+    prepared.peerId = decision.peerId;
+    prepared.slackUserId = decision.slackUserId;
+    prepared.sessionId = decision.sessionId;
+    prepared.metadata = {
+      ...prepared.metadata,
+      source: "slack-record",
+      slack_user: decision.slackUserId,
+      isolation: "record-session",
+    };
+    if (prepared.peerId === prepared.slackUserId || !String(prepared.sessionId).startsWith("record-")) {
+      throw new Error("record-only refused a shared peer write");
+    }
+    accepted.push(prepared);
+    if (!dryRun) await sendRecord(env, prepared, { fetchImpl: opts.fetchImpl, state });
+  }
+  return { dryRun, accepted, skipped, wrote: dryRun ? 0 : accepted.length, slackLookups: 0, recordOnly: true };
+}
+
 export async function backfillLogs(opts = {}) {
+  if (opts.recordOnly) return backfillRecordOnly(opts);
   const env = opts.env || process.env;
   const dryRun = opts.write ? false : true;
   const entries = opts.entries || loadLogEntries(opts.dir || "log/raw");
@@ -229,10 +296,50 @@ function argValue(flag) {
 
 async function main() {
   const write = process.argv.includes("--write");
+  const recordOnly = process.argv.includes("--record-only");
   const dir = argValue("--dir") || "log/raw";
+  const since = argValue("--since");
+  const channel = argValue("--channel");
+  if (recordOnly && (!channel || !since)) {
+    console.error("honcho backfill: --record-only requires --channel and --since (Slack ts of channel creation). Refusing a broader import.");
+    process.exit(1);
+  }
   if (write && !process.env.HONCHO_API_KEY) {
     console.error("honcho backfill: HONCHO_API_KEY is required for --write");
     process.exit(1);
+  }
+  if (recordOnly) {
+    if (!fs.existsSync(dir)) {
+      console.error(`honcho backfill: no directory ${dir}`);
+      process.exit(1);
+    }
+    const result = await backfillLogs({
+      dir,
+      write,
+      env: process.env,
+      recordOnly: true,
+      channel,
+      since,
+    });
+    if (result.dryRun) {
+      for (const row of result.accepted) {
+        process.stdout.write(JSON.stringify({
+          session_id: row.sessionId,
+          peer_id: row.peerId,
+          slack_user: row.slackUserId,
+          content: row.content,
+          metadata: row.metadata,
+          created_at: row.createdAt,
+        }) + "\n");
+      }
+    }
+    const skipBits = Object.entries(result.skipped).map(([k, n]) => `${k}=${n}`).join(" ");
+    console.error(
+      `honcho backfill record-only: accepted=${result.accepted.length} wrote=${result.wrote} dry_run=${result.dryRun} channel=${channel} since=${since}`
+      + (skipBits ? ` skipped ${skipBits}` : ""),
+    );
+    console.error("honcho backfill: this is only the ts >= --since window for that channel. Live capture still needs SILENT_RECORD=1. Do not use a plain --write for this channel.");
+    return;
   }
   if (!fs.existsSync(dir)) {
     console.error(`honcho backfill: no directory ${dir}`);

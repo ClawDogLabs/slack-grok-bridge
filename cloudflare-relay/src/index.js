@@ -32,7 +32,18 @@
  * 3-second deadline is never at risk.
  */
 
-import { eventChannelId, fetchWakeContext, honchoReadEnabled, ingestIfEnabled, isSilentEvent, silentChannelSet } from "./honcho.js";
+import {
+  classifyRecordSearch,
+  eventChannelId,
+  fetchWakeContext,
+  formatRecordReply,
+  honchoReadEnabled,
+  ingestIfEnabled,
+  ingestSilentIfEnabled,
+  isSilentEvent,
+  queryRecordSession,
+  silentChannelSet,
+} from "./honcho.js";
 
 const enc = new TextEncoder();
 const FORWARD_SUBTYPES = new Set(["file_share", "slack_audio"]);
@@ -494,6 +505,27 @@ async function lookupIngestChannel(env, channel) {
 // outside WATCH_CHANNEL_IDS) and for our own bot replies in public channels.
 // Returns null when HONCHO_INGEST is off. Caller must only waitUntil the promise.
 // Missing channel_type: HONCHO_CHANNEL_IDS, else conversations.info, else skip.
+function scheduleSilentRecord(env, e) {
+  return ingestSilentIfEnabled(env, e, {
+    log: (...a) => log(...a),
+    resolveDisplay: async (userId) => {
+      const u = await resolveUser(env, userId);
+      return u?.display_name || u?.real_name || u?.name || null;
+    },
+  });
+}
+
+async function deliverRecordSearch(env, event, decision) {
+  if (!decision || decision.kind !== "allow") return;
+  const dm = String(event?.channel || "");
+  if (event?.channel_type !== "im" || !dm.startsWith("D")) return;
+  if (isSilentEvent(env, event) || dm === decision.channelId) return;
+  const result = await queryRecordSession(env, { source: "slack-im", event });
+  const text = formatRecordReply(result, { label: decision.channelId });
+  await slackApi(env, "chat.postMessage", { channel: dm, text });
+  log("record search posted", decision.channelId, decision.requesterId, result.ok ? (result.messages || []).length : (result.error || "fail"));
+}
+
 function scheduleHoncho(env, c, e) {
   if (isSilentEvent(env, e)) return null;
   return ingestIfEnabled(env, e, {
@@ -549,14 +581,25 @@ export default {
     if (body.type === "url_verification") return json({ challenge: body.challenge });
     if (body.type !== "event_callback") return json({ ok: true, action: "ignore", reason: `type:${body.type}` });
 
-    // Mute before auth.test, ack, thinking, hold-ack, welcome, wake, or ingest.
+    // Mute before auth.test, ack, thinking, hold-ack, welcome, wake, or public ingest.
     // Covers app_mention (including edited), message, message_changed, joins,
     // member_joined_channel, threads, and retries. HTTP 200 is the Slack
-    // protocol ack only. Recording stays off: this branch does not write Honcho.
+    // protocol ack only. Optional SILENT_RECORD writes an isolated Honcho
+    // session and never attaches it to a wake.
     if (isSilentEvent(env, body.event)) {
       const e = body.event;
       log("silent", body.event_id, e?.type, e?.subtype || "", eventChannelId(e), e?.ts || e?.message?.ts || "", e?.edited ? "edited" : "");
+      const recordTask = scheduleSilentRecord(env, e);
+      if (recordTask) ctx.waitUntil(recordTask);
       return json({ ok: true, action: "ignore", reason: "silent" }, 200, { "X-Relay-Action": "ignore:silent" });
+    }
+
+    // Explicit 1:1 search only. A deny or a normal DM does not fetch record sessions.
+    const search = classifyRecordSearch(env, body.event);
+    if (search.kind === "allow") {
+      log("record search", search.channelId, search.requesterId, body.event?.channel);
+      ctx.waitUntil(deliverRecordSearch(env, body.event, search).catch((err) => log("record search failed", err?.message || err)));
+      return json({ ok: true, action: "record_search", reason: "im" }, 200, { "X-Relay-Action": "record-search:im" });
     }
 
     await ensureSelf(env);

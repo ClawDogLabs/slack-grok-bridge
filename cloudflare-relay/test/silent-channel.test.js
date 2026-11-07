@@ -11,7 +11,7 @@ import { backfillLogs } from "../../scripts/honcho-backfill.mjs";
 const SECRET = "test-signing-secret";
 const ME = "UBOT0001";
 const SILENT = "C0SYNTH0001";
-const JASON = "U0SYNTH0001";
+const OWNER = "U0SYNTH0001";
 const baseEnv = {
   SLACK_SIGNING_SECRET: SECRET,
   OWN_USER_ID: ME,
@@ -79,23 +79,23 @@ test("route mutes before watch, welcome, and mention, and leaves other channels 
   const edited = {
     type: "app_mention",
     channel: SILENT,
-    user: JASON,
+    user: OWNER,
     text: `<@${ME}> edited`,
     ts: "1710000100.000001",
-    edited: { user: JASON, ts: "1794019288.000100" },
+    edited: { user: OWNER, ts: "1710000101.000001" },
   };
   assert.deepEqual(route(edited, c), { action: "ignore", reason: "silent" });
-  assert.equal(route({ type: "app_mention", channel: SILENT, user: JASON, text: `<@${ME}> hi`, ts: "1710000102.000001" }, c).reason, "silent");
+  assert.equal(route({ type: "app_mention", channel: SILENT, user: OWNER, text: `<@${ME}> hi`, ts: "1710000102.000001" }, c).reason, "silent");
   assert.equal(route({ type: "message", subtype: "channel_join", channel: SILENT, user: "UNEW", ts: "1" }, c).reason, "silent");
   assert.equal(route({ type: "message", subtype: "group_join", channel: SILENT, user: "UNEW", ts: "1" }, c).reason, "silent");
-  assert.equal(route({ type: "member_joined_channel", channel: SILENT, user: JASON }, c).reason, "silent");
+  assert.equal(route({ type: "member_joined_channel", channel: SILENT, user: OWNER }, c).reason, "silent");
   assert.equal(route({
     type: "message",
     channel_type: "group",
     channel: SILENT,
-    user: JASON,
+    user: OWNER,
     text: `<@${ME}> thread`,
-    ts: "1794019400.200000",
+    ts: "1710000106.000001",
     thread_ts: "1710000100.000001",
   }, c).reason, "silent");
   assert.equal(route({
@@ -123,15 +123,15 @@ test("muted events make no Slack, Honcho, or wake calls, including the observed 
   const events = [
     {
       type: "app_mention",
-      user: JASON,
+      user: OWNER,
       text: `<@${ME}> edited mention`,
       ts: "1710000100.000001",
       channel: SILENT,
-      edited: { user: JASON, ts: "1794019288.000100" },
+      edited: { user: OWNER, ts: "1710000101.000001" },
     },
     {
       type: "app_mention",
-      user: JASON,
+      user: OWNER,
       text: `<@${ME}> hey`,
       ts: "1710000102.000001",
       channel: SILENT,
@@ -140,7 +140,7 @@ test("muted events make no Slack, Honcho, or wake calls, including the observed 
       type: "message",
       channel: SILENT,
       channel_type: "group",
-      user: JASON,
+      user: OWNER,
       text: `<@${ME}> hey`,
       ts: "1710000102.000001",
     },
@@ -149,35 +149,35 @@ test("muted events make no Slack, Honcho, or wake calls, including the observed 
       subtype: "message_changed",
       hidden: true,
       channel: SILENT,
-      ts: "1794019380.100000",
+      ts: "1710000104.000001",
       message: {
         type: "message",
-        user: JASON,
+        user: OWNER,
         text: `<@${ME}> edited body`,
         ts: "1710000100.000001",
-        edited: { user: JASON, ts: "1794019380.100000" },
+        edited: { user: OWNER, ts: "1710000104.000001" },
       },
     },
     {
       type: "message",
       subtype: "message_changed",
       hidden: true,
-      ts: "1794019381.100000",
+      ts: "1710000105.000001",
       message: {
         channel: SILENT,
-        user: JASON,
+        user: OWNER,
         text: "channel only on the nested message",
         ts: "1710000100.000001",
-        edited: { user: JASON, ts: "1794019381.100000" },
+        edited: { user: OWNER, ts: "1710000105.000001" },
       },
     },
     {
       type: "message",
       channel: SILENT,
       channel_type: "group",
-      user: JASON,
+      user: OWNER,
       text: `<@${ME}> in the thread`,
-      ts: "1794019400.200000",
+      ts: "1710000106.000001",
       thread_ts: "1710000100.000001",
     },
     {
@@ -186,7 +186,7 @@ test("muted events make no Slack, Honcho, or wake calls, including the observed 
       channel: SILENT,
       user: "UNEW",
       text: "<@UNEW> has joined the channel",
-      ts: "1794019500.000001",
+      ts: "1710000107.000001",
     },
     {
       type: "message",
@@ -194,23 +194,23 @@ test("muted events make no Slack, Honcho, or wake calls, including the observed 
       channel: SILENT,
       user: "UNEW",
       text: "<@UNEW> has joined the private channel",
-      ts: "1794019500.000002",
+      ts: "1710000108.000001",
     },
     {
       type: "member_joined_channel",
-      user: JASON,
+      user: OWNER,
       channel: SILENT,
       channel_type: "G",
-      ts: "1794019501.000001",
+      ts: "1710000109.000001",
     },
     {
       type: "message",
       channel: SILENT,
       channel_type: "group",
-      user: JASON,
+      user: OWNER,
       subtype: "slack_audio",
       text: "",
-      ts: "1794019600.000001",
+      ts: "1710000110.000001",
       files: [{ id: "F1", mimetype: "audio/mp4", filetype: "m4a" }],
     },
   ];
@@ -309,7 +309,7 @@ test("silent channels are not public-ingested and backfill skips them", async ()
   const state = createHonchoState();
   const task = ingestIfEnabled(
     baseEnv,
-    { type: "message", channel_type: "channel", channel: SILENT, user: JASON, text: "private note", ts: "1710000102.000001" },
+    { type: "message", channel_type: "channel", channel: SILENT, user: OWNER, text: "private note", ts: "1710000102.000001" },
     { fetchImpl, state, log() {} },
   );
   assert.equal(task, null);
@@ -326,8 +326,8 @@ test("silent channels are not public-ingested and backfill skips them", async ()
   assert.equal(urls.filter((u) => u.endsWith("/messages")).length, 1);
   const result = await backfillLogs({
     entries: [
-      { channel: SILENT, channel_type: "group", ts: "1710000102.000001", user: JASON, text: "do not store on the shared peer" },
-      { channel: SILENT, channel_type: "channel", ts: "1794019374.502289", user: JASON, text: "still not a public peer write" },
+      { channel: SILENT, channel_type: "group", ts: "1710000102.000001", user: OWNER, text: "do not store on the shared peer" },
+      { channel: SILENT, channel_type: "channel", ts: "1710000103.000001", user: OWNER, text: "still not a public peer write" },
       { channel: "CPUBLIC", channel_type: "channel", ts: "1710000002.000100", user: "UHUMAN", text: "public note stays" },
     ],
     env: { ...baseEnv, HONCHO_CHANNEL_IDS: `${SILENT},CPUBLIC` },

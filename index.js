@@ -504,12 +504,53 @@ async function processInbound({ kind, event, client, logger, sayOnFail }) {
   }
 }
 
+function silentRecordOn() {
+  const v = String(process.env.SILENT_RECORD || "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function fireSilentRecord(event, client, logger) {
+  if (!silentRecordOn()) return;
+  void import("./cloudflare-relay/src/honcho.js")
+    .then((m) => m.ingestSilentIfEnabled(process.env, event, {
+      log: (...args) => (logger?.info ? logger.info(...args) : console.log(...args)),
+      resolveDisplay: async (userId) => {
+        const info = await resolveUser(client, userId);
+        return info?.display_name || info?.real_name || info?.name || null;
+      },
+    }))
+    .catch((err) => {
+      const msg = err?.message || err;
+      if (logger?.error) logger.error(`[${ts()}] honcho record failed`, msg);
+      else console.error(`[${ts()}] honcho record failed`, msg);
+    });
+}
+
+async function maybeAnswerRecordSearch(event, client, logger) {
+  if (event?.channel_type !== "im" || !String(event?.channel || "").startsWith("D")) return false;
+  if (!/\b(search|history|transcript|recall|recorded|recording|what was said|what did)\b/i.test(String(event?.text || ""))) return false;
+  const m = await import("./cloudflare-relay/src/honcho.js");
+  const decision = m.classifyRecordSearch(process.env, event);
+  if (decision.kind !== "allow") return false;
+  try {
+    const result = await m.queryRecordSession(process.env, { source: "slack-im", event });
+    const text = m.formatRecordReply(result, { label: decision.channelId });
+    await client.chat.postMessage({ channel: event.channel, text });
+    logger?.info?.(`[${ts()}] record search posted`, decision.channelId, decision.requesterId);
+  } catch (err) {
+    logger?.error?.(`[${ts()}] record search failed`, err?.message || err);
+  }
+  return true;
+}
+
 app.event("app_mention", async ({ event, say, client, logger }) => {
   // Before thinking, reaction, hold-ack, and wake. Edited mentions included.
   if (isSilentEvent(event)) {
     logger.info(`[${ts()}] silent channel; no ack, no wake`, eventChannelId(event), event?.ts);
+    fireSilentRecord(event, client, logger);
     return;
   }
+  if (await maybeAnswerRecordSearch(event, client, logger)) return;
   if (!isAllowedBotMention(event)) {
     logger.info("app_mention ignored (bot not allowlisted)", event.bot_id, event.user);
     return;
@@ -535,8 +576,10 @@ app.message(async ({ message, client, logger }) => {
   // outer event or on message.message. Recording is not enabled here.
   if (isSilentEvent(message)) {
     logger.info(`[${ts()}] silent channel; no ack, no wake`, eventChannelId(message), message?.ts || message?.message?.ts);
+    fireSilentRecord(message, client, logger);
     return;
   }
+  if (await maybeAnswerRecordSearch(message, client, logger)) return;
   // Silent public-channel ingest. Does not set thinking or wake Grok.
   // Slack only delivers these when message.channels is subscribed. DMs are filtered out.
   fireHonchoIngest(message, honchoExtras(client, logger));
