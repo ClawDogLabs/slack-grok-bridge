@@ -16,24 +16,33 @@ test("privroomSynthEnabled kill switch", () => {
   assert.equal(privroomSynthEnabled({ PRIVROOM_SYNTHESIZE: "off" }), false);
 });
 
-test("matchPrivroomBot by user id and bot id", () => {
-  assert.equal(matchPrivroomBot({ user: "UPLACEHOLDER2" }).name, "Person");
-  assert.equal(matchPrivroomBot({ bot_id: "BPLACEHOLDER2" }).name, "Valkyrie");
-  assert.equal(matchPrivroomBot({ user: "UPLACEHOLDER4", bot_id: "BPLACEHOLDER3" }).name, "Person");
-  assert.equal(matchPrivroomBot({ bot_id: "BPLACEHOLDER4" }).name, "Person");
-  assert.equal(matchPrivroomBot({ user: "UPLACEHOLDER6", bot_id: "BPLACEHOLDER5" }), null); // Bot
-  assert.equal(matchPrivroomBot({ user: "UHUMAN" }), null);
+const ROSTER = JSON.stringify([
+  { name: "BotA", userId: "UPLACEHOLDER2", botId: "BPLACEHOLDER1" },
+  { name: "BotB", userId: "UPLACEHOLDER3", botId: "BPLACEHOLDER2" },
+  { name: "BotC", userId: "UPLACEHOLDER4", botId: "BPLACEHOLDER3" },
+  { name: "BotD", userId: "UPLACEHOLDER5", botId: "BPLACEHOLDER4" },
+]);
+const rosterEnv = { PRIVROOM_BOTS: ROSTER };
+
+test("matchPrivroomBot is empty unless PRIVROOM_BOTS is set", () => {
+  assert.equal(matchPrivroomBot({ user: "UPLACEHOLDER2" }), null);
+  assert.equal(matchPrivroomBot({ bot_id: "BPLACEHOLDER2" }, rosterEnv).name, "BotB");
+  assert.equal(matchPrivroomBot({ user: "UPLACEHOLDER2" }, rosterEnv).name, "BotA");
+  assert.equal(matchPrivroomBot({ user: "UPLACEHOLDER4", bot_id: "BPLACEHOLDER3" }, rosterEnv).name, "BotC");
+  assert.equal(matchPrivroomBot({ bot_id: "BPLACEHOLDER4" }, rosterEnv).name, "BotD");
+  assert.equal(matchPrivroomBot({ user: "UPLACEHOLDER6", bot_id: "BPLACEHOLDER5" }, rosterEnv), null);
+  assert.equal(matchPrivroomBot({ user: "UHUMAN" }, rosterEnv), null);
 });
 
 test("buildPrivroomSynthPayload shape", () => {
   const payload = buildPrivroomSynthPayload(
-    { BRIDGE_SOURCE: "slack-bot-bridge" },
+    { BRIDGE_SOURCE: "slack-bot-bridge", PRIVROOM_BOTS: ROSTER },
     {
       channel: "C1",
       ts: "111.222",
       question: "best bag?",
       invoker: "UINV",
-      replied: ["Person", "Valkyrie"],
+      replied: ["BotA", "BotB"],
     },
     "timer",
   );
@@ -44,8 +53,8 @@ test("buildPrivroomSynthPayload shape", () => {
     thread_ts: "111.222",
     question: "best bag?",
     invoker: "UINV",
-    replied: ["Person", "Valkyrie"],
-    missing: ["Person", "Person"],
+    replied: ["BotA", "BotB"],
+    missing: ["BotC", "BotD"],
     reason: "timer",
   });
 });

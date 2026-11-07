@@ -586,17 +586,11 @@ async function applySticky(env, c, e) {
   await processInbound(env, c, "app_mention", e, true, otherTag ? { sticky: true, sticky_other_tag: true } : { sticky: true });
 }
 
-// Private-room synthesize roster. Placeholder defaults match no real workspace.
-// PRIVROOM_BOTS JSON overrides: [{"name":"...","userId":"U...","botId":"B..."}].
-const DEFAULT_PRIVROOM_BOTS = [
-  { name: "Person", userId: "UPLACEHOLDER2", botId: "BPLACEHOLDER1" },
-  { name: "Valkyrie", userId: "UPLACEHOLDER3", botId: "BPLACEHOLDER2" },
-  { name: "Person", userId: "UPLACEHOLDER4", botId: "BPLACEHOLDER3" },
-  { name: "Person", userId: "UPLACEHOLDER5", botId: "BPLACEHOLDER4" },
-];
+// Private-room synthesize roster. Empty unless PRIVROOM_BOTS is set.
+// JSON: [{"name":"BotA","userId":"U...","botId":"B..."}]. Bad JSON matches nobody.
 export function privroomBotsOf(env) {
   const raw = env?.PRIVROOM_BOTS;
-  if (raw === undefined || raw === null || String(raw).trim() === "") return DEFAULT_PRIVROOM_BOTS;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return [];
   let arr;
   try { arr = JSON.parse(String(raw)); } catch { return []; }
   if (!Array.isArray(arr)) return [];

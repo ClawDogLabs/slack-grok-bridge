@@ -81,9 +81,9 @@ HONCHO_ARCHIVE_CHANNEL_IDS = "CPLACEHOLDER1"
 # Sticky threads need a KV binding named PRIVROOM_STATE. "0" disables.
 STICKY_THREADS = "1"
 # Private-room synthesize needs PRIVROOM_STATE and a queue binding PRIVROOM_SYNTH.
-# Bot roster JSON overrides the placeholder defaults. "0" disables.
+# Bot roster is required for synthesize matching. Unset matches nobody. "0" disables.
 PRIVROOM_SYNTHESIZE = "1"
-# PRIVROOM_BOTS = '[{"name":"Person","userId":"UPLACEHOLDER2","botId":"BPLACEHOLDER1"}]'
+# PRIVROOM_BOTS = '[{"name":"BotA","userId":"UPLACEHOLDER2","botId":"BPLACEHOLDER1"}]'
 PRIVROOM_DELAY_SECONDS = "300"
 
 # Secrets (set with `npx wrangler secret put NAME`, never in this file):
