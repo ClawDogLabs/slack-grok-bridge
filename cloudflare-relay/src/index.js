@@ -263,6 +263,9 @@ async function slackApi(env, method, body, { get = false, quiet = false } = {}) 
   }
   const data = await res.json().catch(() => ({ ok: false, error: `http_${res.status}` }));
   if (!data.ok && !quiet) log(`slack ${method} failed:`, data.error);
+  if (!get && method === "chat.postMessage") {
+    await noteOwnRootPost(env, body, data).catch((err) => log("sticky claim error", err?.message || err));
+  }
   return data;
 }
 
@@ -543,9 +546,13 @@ function scheduleHoncho(env, c, e) {
 }
 
 // Sticky thread ownership. A human mention of only this bot marks the thread.
-// Later untagged human replies wake with sticky:true. Other tags wake with
-// sticky_other_tag and do not clear the mark. STICKY_THREADS=0/false/off disables.
+// A root message from this bot does too (it started the thread). A reply posted
+// into an existing thread does not. Later untagged human replies wake with
+// sticky:true. Other tags wake with sticky_other_tag and do not clear the mark.
+// Bot messages never wake. An existing mark is not replaced by a later claim.
+// STICKY_THREADS=0/false/off disables. TTL is 7 days.
 const STICKY_TTL_SECONDS = 7 * 24 * 3600;
+const STICKY_OWN_SUBTYPES = new Set(["bot_message", "file_share", "slack_audio"]);
 export function stickyEnabled(env) {
   const v = String(env?.STICKY_THREADS ?? "1").toLowerCase();
   return v !== "0" && v !== "false" && v !== "off";
@@ -554,13 +561,25 @@ export function taggedUserIds(text) {
   return [...String(text || "").matchAll(/<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g)].map((m) => m[1]);
 }
 const stickyKey = (channel, root) => `sticky:${channel}:${root}`;
+function isOwnEvent(e, c) {
+  if (!e || !c) return false;
+  if (c.ownBotId && e.bot_id && e.bot_id === c.ownBotId) return true;
+  if (c.ownUserId && e.user && e.user === c.ownUserId) return true;
+  return false;
+}
 export function stickyOp(e, c) {
   if (!e || !c?.ownUserId || !e.channel) return { op: null };
   const isApp = e.type === "app_mention";
   if (!isApp && e.type !== "message") return { op: null };
   if (!isApp && e.channel_type !== "channel" && e.channel_type !== "group") return { op: null };
   if (String(e.channel).startsWith("D")) return { op: null };
-  if (e.bot_id || e.user === c.ownUserId || !e.user) return { op: null };
+  if (isOwnEvent(e, c)) {
+    if (isApp) return { op: null };
+    if (e.subtype && !STICKY_OWN_SUBTYPES.has(e.subtype)) return { op: null };
+    if (!e.ts || (e.thread_ts && e.thread_ts !== e.ts)) return { op: null };
+    return { op: "claim", root: e.ts };
+  }
+  if (e.bot_id || !e.user) return { op: null };
   if (e.subtype && !FORWARD_SUBTYPES.has(e.subtype) && e.subtype !== "slack_audio") return { op: null };
   const root = e.thread_ts || e.ts;
   const tags = [...new Set(taggedUserIds(e.text))];
@@ -571,19 +590,46 @@ export function stickyOp(e, c) {
   if (e.thread_ts && e.thread_ts !== e.ts) return { op: "check", root, otherTag: other };
   return { op: null };
 }
+async function putSticky(env, key, record) {
+  await env.PRIVROOM_STATE.put(key, JSON.stringify(record), { expirationTtl: STICKY_TTL_SECONDS });
+}
 async function applySticky(env, c, e) {
   if (!stickyEnabled(env) || !env.PRIVROOM_STATE) return;
   if (isSilentEvent(env, e)) return;
   const { op, root, otherTag } = stickyOp(e, c);
   if (!op) return;
   const key = stickyKey(e.channel, root);
+  if (op === "claim") {
+    if (await env.PRIVROOM_STATE.get(key)) return;
+    await putSticky(env, key, { by: c.ownUserId, at: Date.now(), via: "bot" });
+    return log("sticky claim", e.channel, root);
+  }
   if (op === "set") {
-    await env.PRIVROOM_STATE.put(key, JSON.stringify({ by: e.user, at: Date.now() }), { expirationTtl: STICKY_TTL_SECONDS });
+    await putSticky(env, key, { by: e.user, at: Date.now(), via: "mention" });
     return log("sticky set", e.channel, root);
   }
   if (!(await env.PRIVROOM_STATE.get(key))) return;
   log("sticky wake", e.channel, root, e.ts);
   await processInbound(env, c, "app_mention", e, true, otherTag ? { sticky: true, sticky_other_tag: true } : { sticky: true });
+}
+
+/** Claim a thread this Worker just opened. Threaded posts, DMs, and muted channels do not claim. An existing mark is left as it is. */
+export async function noteOwnRootPost(env, body, result) {
+  if (!stickyEnabled(env) || !env?.PRIVROOM_STATE) return;
+  if (!result?.ok || !result.ts || !body || typeof body !== "object") return;
+  if (body.thread_ts) return;
+  const channel = String(body.channel || "");
+  if (!channel || channel.startsWith("D")) return;
+  if (isSilentEvent(env, { channel })) return;
+  const key = stickyKey(channel, result.ts);
+  if (await env.PRIVROOM_STATE.get(key)) return;
+  // Identity comes from OWN_USER_ID or an earlier auth.test. Do not call
+  // ensureSelf here: muted events must stay ahead of auth.test, and the
+  // Slack echo of this post claims once the event path has resolved it.
+  const c = cfg(env);
+  if (!c.ownUserId) return;
+  await putSticky(env, key, { by: c.ownUserId, at: Date.now(), via: "send" });
+  log("sticky claim", channel, result.ts);
 }
 
 // Private-room synthesize roster. Empty unless PRIVROOM_BOTS is set.

@@ -79,6 +79,9 @@ HONCHO_ARCHIVE_SESSION = "archive-private"
 HONCHO_PLAYBOOKS_SESSION = "privroom-playbooks"
 HONCHO_ARCHIVE_CHANNEL_IDS = "CPLACEHOLDER1"
 # Sticky threads need a KV binding named PRIVROOM_STATE. "0" disables.
+# A sole @mention, or a root message from this bot, owns the thread for 7 days.
+# A reply inside an existing thread does not. Untagged human replies wake.
+# Messages from bots do not. Muted channels never claim or wake.
 STICKY_THREADS = "1"
 # Private-room synthesize needs PRIVROOM_STATE and a queue binding PRIVROOM_SYNTH.
 # Bot roster is required for synthesize matching. Unset matches nobody. "0" disables.

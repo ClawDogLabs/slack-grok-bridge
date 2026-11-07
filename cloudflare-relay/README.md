@@ -164,7 +164,16 @@ Deploy the mute (do this only when you intend to ship; this repo does not deploy
 
 `node-http-relay` imports this module, so the same variable mutes there too. Socket Mode checks the variable at the start of `app_mention` and `message`, before thinking status. The live host is the Worker.
 
-This tree is `origin/main` plus this guard. It does not contain reported commits `a56ca24`, `3dcafa5`, or the deployed revision `2b1c4525`, and it has no Voltron or sticky-session path. Deploying it replaces the live Worker with this source. If production is running unpublished commits, cherry-pick this guard onto that source instead of rolling the service back.
+## Thread ownership
+
+A thread this bot owns wakes on a later human reply that does not @mention anyone. Two starts create that ownership, both stored in `PRIVROOM_STATE` for 7 days (`sticky:<channel>:<root ts>`):
+
+- A person @mentions only this bot. Mentioning this bot and someone else does not take the thread.
+- This bot posts the root message. Slack delivers that post back as a `message` event (`bot_message`, this bot's user id or bot id, no parent `thread_ts`). The Worker marks the thread and does not wake. The same mark is written when this Worker itself posts a root `chat.postMessage` (no `thread_ts`).
+
+A post that only replies inside an existing thread (`thread_ts` different from `ts`) does not take that thread. If a mark is already stored, a later root event does not replace it. An @mention of someone else wakes with `sticky_other_tag: true` and leaves the mark in place, so the next untagged human reply still wakes. Messages from any bot, including this one, never wake.
+
+`STICKY_THREADS=0`, `false`, or `off` disables it. The KV binding has to be named `PRIVROOM_STATE`. `OWN_USER_ID` (or a successful `auth.test`) has to identify this bot. `message.channels` must be subscribed or Slack will not deliver the bot's own root post; private channels need `message.groups` as well. No separate callback from the reply routine is required. A new conversation the routine starts has to be a top-level `chat.postMessage` with no `thread_ts`. A send that sets `thread_ts` is a reply and does not claim. Muted channels return before this runs, so they neither claim nor wake. `SILENT_RECORD`, `ACK_REACTION`, and `HOLD_ACK` are independent: leave them as set in untracked runtime config. `HOLD_ACK` stays off unless that var is true. The ack reaction stays whatever `ACK_REACTION` names.
 
 ## Private record (off by default)
 
