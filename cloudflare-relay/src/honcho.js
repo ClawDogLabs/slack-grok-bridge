@@ -99,6 +99,66 @@ export function honchoIngestEnabled(env) {
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
 
+/** Archive session id. Override with HONCHO_ARCHIVE_SESSION. */
+export function archiveSessionOf(env) {
+  const id = String(env?.HONCHO_ARCHIVE_SESSION || "archive-private").trim();
+  return id || "archive-private";
+}
+
+/** Playbooks session attached with Archive. Override with HONCHO_PLAYBOOKS_SESSION. */
+export function playbooksSessionOf(env) {
+  const id = String(env?.HONCHO_PLAYBOOKS_SESSION || "privroom-playbooks").trim();
+  return id || "privroom-playbooks";
+}
+
+/**
+ * Channels allowed to read the archive/playbook sessions.
+ * Unset uses the placeholder private-room id, which matches no real workspace.
+ * Set HONCHO_ARCHIVE_CHANNEL_IDS in untracked runtime config for a real room.
+ */
+export function archiveChannelsOf(env) {
+  const raw = env?.HONCHO_ARCHIVE_CHANNEL_IDS;
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return new Set(["CPLACEHOLDER1"]);
+  }
+  return parseChannelIds(raw) || new Set();
+}
+
+/**
+ * HONCHO_PRIVATE_SESSIONS JSON: {"session-id":["C..."]} or
+ * {"session-id":{"channels":["C..."],"key":"archive","peer":false}}.
+ * Unset uses archive + playbooks for archiveChannelsOf. Bad JSON attaches nothing.
+ */
+export function privateSessionsOf(env) {
+  const raw = env?.HONCHO_PRIVATE_SESSIONS;
+  const out = new Map();
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    const chans = [...archiveChannelsOf(env)];
+    out.set(archiveSessionOf(env), { channels: new Set(chans), key: "archive", peer: true });
+    out.set(playbooksSessionOf(env), { channels: new Set(chans), key: "playbooks", peer: false });
+    return out;
+  }
+  let obj;
+  try { obj = JSON.parse(String(raw)); } catch { return out; }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
+  for (const [sid, v] of Object.entries(obj)) {
+    if (!ID_RE.test(sid)) continue;
+    const cfg = Array.isArray(v) ? { channels: v } : (v && typeof v === "object" ? v : null);
+    if (!cfg || !Array.isArray(cfg.channels)) continue;
+    const channels = new Set(cfg.channels.map((c) => String(c).trim()).filter((c) => ID_RE.test(c)));
+    const key = typeof cfg.key === "string" && ID_RE.test(cfg.key) ? cfg.key : sid;
+    out.set(sid, { channels, key, peer: cfg.peer !== false });
+  }
+  return out;
+}
+
+/** Channels named by the private-session map. */
+export function privateChannelsOf(env) {
+  const set = new Set();
+  for (const { channels } of privateSessionsOf(env).values()) for (const c of channels) set.add(c);
+  return set;
+}
+
 export function workspaceIdOf(env) {
   const id = String(env?.HONCHO_WORKSPACE_ID || "slack-workspace").trim();
   return id || "slack-workspace";
@@ -212,7 +272,7 @@ function asChannelKind(value) {
 export async function resolveIngestChannel(event, opts = {}) {
   const allowlist = opts.allowlist === undefined ? null : parseChannelIds(opts.allowlist);
   const mode = opts.allowlistMode || "unresolved";
-  const sync = classifyChannelSync(event, { allowlist, allowlistMode: mode });
+  const sync = classifyChannelSync(event, { allowlist, allowlistMode: mode, privateChannels: opts.privateChannels });
   if (sync) return sync;
   const channel = String(event?.channel || "");
   const cache = opts.cache || lookupCache;
@@ -233,10 +293,15 @@ export async function resolveIngestChannel(event, opts = {}) {
   return { ok: false, reason: "needs-channel-type" };
 }
 
-function classifyChannelSync(event, { allowlist, allowlistMode }) {
+function classifyChannelSync(event, { allowlist, allowlistMode, privateChannels }) {
   if (!event || typeof event !== "object") return { ok: false, reason: "no-event" };
   const channel = String(event.channel || "");
   const ct = event.channel_type;
+  // Private-room opt-in: listed in both the ingest allowlist and the private-session map.
+  // Stored only as channel-<id> with private metadata. Never DMs or group DMs.
+  if ((ct === "group" || !ct) && !channel.startsWith("D") && privateChannels?.has?.(channel) && allowlist?.has(channel)) {
+    return { ok: true, event: { ...event, channel_type: "group", _honchoPrivate: true } };
+  }
   if (ct === "im" || ct === "mpim" || ct === "group" || channel.startsWith("D")) {
     return { ok: false, reason: "not-public" };
   }
@@ -291,7 +356,7 @@ export function decideIngest(event, opts = {}) {
   if (event.type && event.type !== "message" && event.type !== "app_mention") {
     return { ok: false, reason: "type" };
   }
-  if (!isPublicChannel(event)) return { ok: false, reason: "not-public" };
+  if (!isPublicChannel(event) && event._honchoPrivate !== true) return { ok: false, reason: "not-public" };
   if (event.hidden) return { ok: false, reason: "hidden" };
 
   const own = isOwnOutbound(event, opts);
@@ -317,6 +382,7 @@ export function decideIngest(event, opts = {}) {
     peerId,
     channel,
     sessionId: sessionIdForChannel(channel),
+    private: event._honchoPrivate === true,
     text,
     ts: String(event.ts),
     threadTs: event.thread_ts || null,
@@ -354,6 +420,7 @@ export async function materialize(decision, opts = {}) {
     channel: decision.channel,
     source: "slack",
   };
+  if (decision.private) metadata.private = true;
   if (decision.threadTs) metadata.thread_ts = decision.threadTs;
   if (decision.subtype) metadata.subtype = decision.subtype;
   if (display) metadata.author_display = display;
@@ -419,7 +486,9 @@ export async function sendIngest(env, prepared, opts = {}) {
   if (!state.sessions.has(prepared.sessionId)) {
     await honchoPost(env, `/v3/workspaces/${encodeURIComponent(ws)}/sessions`, {
       id: prepared.sessionId,
-      metadata: { channel: prepared.channel, source: "slack" },
+      metadata: prepared.private
+        ? { channel: prepared.channel, source: "slack", private: true }
+        : { channel: prepared.channel, source: "slack" },
     }, fetchImpl);
     state.sessions.add(prepared.sessionId);
   }
@@ -498,6 +567,7 @@ export function ingestIfEnabled(env, event, opts = {}) {
     sync = classifyChannelSync(event, {
       allowlist: parseChannelIds(allowlist),
       allowlistMode: opts.allowlistMode || "unresolved",
+      privateChannels: opts.privateChannels || privateChannelsOf(env),
     });
   } catch (err) {
     (opts.log || console.log)("honcho ingest failed", err?.message || err);
@@ -578,9 +648,15 @@ async function fetchSessionContext(env, sessionId, opts = {}) {
 
     const peer = String(opts.peer || "").trim();
     const params = new URLSearchParams();
-    params.set("tokens", String(opts.tokens ?? 1200));
+    const tokenDefault = Number.parseInt(env?.HONCHO_READ_TOKENS ?? "3000", 10);
+    params.set("tokens", String(opts.tokens ?? (Number.isFinite(tokenDefault) && tokenDefault > 0 ? tokenDefault : 3000)));
     params.set("summary", opts.summary === false ? "false" : "true");
-    if (peer && ID_RE.test(peer)) params.set("peer_target", peer);
+    if (peer && ID_RE.test(peer)) {
+      params.set("peer_target", peer);
+      // Public wakes ask for this session's facts only, so a global card
+      // cannot carry private-room material.
+      if (opts.limitToSession) params.set("limit_to_session", "true");
+    }
 
     const fetchImpl = opts.fetchImpl || globalThis.fetch;
     const base = String(env.HONCHO_API_BASE || HONCHO_BASE).replace(/\/$/, "");
@@ -613,7 +689,9 @@ async function fetchSessionContext(env, sessionId, opts = {}) {
 /**
  * Session context for the wake payload. Prefer this over peer /chat (too slow).
  * Never throws. Always includes ms. Fail-open for the caller.
- * Only the per-channel session (`channel-<id>`). No extra sessions.
+ * Public wakes read only `channel-<id>` with limit_to_session and no peer_card.
+ * Channels listed in HONCHO_PRIVATE_SESSIONS also receive those mapped sessions
+ * (archive, playbooks). Record-only silent channels are never read here.
  */
 export async function fetchWakeContext(env, { channel, user, text, channelType } = {}, opts = {}) {
   const started = Date.now();
@@ -623,7 +701,6 @@ export async function fetchWakeContext(env, { channel, user, text, channelType }
     if (!key) return done({ ok: false, error: "no-key" });
     const channelId = String(channel || "").trim();
     if (!channelId || !ID_RE.test(channelId)) return done({ ok: false, error: "bad-channel" });
-    // Record-only sessions are never wake context. Do not name or fetch them here.
     if (isSilentEvent(env, { channel: channelId })) return done({ ok: false, error: "silent" });
     const ws = workspaceIdOf(env);
     if (!ID_RE.test(ws)) return done({ ok: false, error: "bad-workspace" });
@@ -632,17 +709,33 @@ export async function fetchWakeContext(env, { channel, user, text, channelType }
 
     void text;
     void channelType;
-
-    const channelCtx = await fetchSessionContext(env, sessionId, {
-      peer: String(user || "").trim(),
+    const peer = String(user || "").trim();
+    const isPrivateRoom = privateChannelsOf(env).has(channelId);
+    const allowPeerRep = isPrivateRoom || /^(1|true|yes|on)$/i.test(String(env?.HONCHO_PUBLIC_PEER_REP || "").trim());
+    const extras = [];
+    for (const [sid, cfg] of privateSessionsOf(env)) {
+      if (cfg.channels.has(channelId) && sid !== sessionId) extras.push([sid, cfg]);
+    }
+    const totalTimeout = opts.timeoutMs ?? readTimeoutMs(env);
+    const perTimeout = extras.length ? Math.max(1, Math.floor(totalTimeout / 2)) : totalTimeout;
+    const common = {
+      peer,
+      limitToSession: !allowPeerRep,
       tokens: opts.tokens,
       summary: opts.summary,
       recentLimit: opts.recentLimit,
       fetchImpl: opts.fetchImpl,
-      timeoutMs: opts.timeoutMs ?? readTimeoutMs(env),
-    });
-    const { sessionId: _sid, ...rest } = channelCtx;
-    return done({ ...rest, sessionId });
+      timeoutMs: perTimeout,
+    };
+    const results = await Promise.all([
+      fetchSessionContext(env, sessionId, common),
+      ...extras.map(([sid, cfg]) => fetchSessionContext(env, sid, { ...common, peer: cfg.peer ? common.peer : "" })),
+    ]);
+    const { sessionId: _sid, ...rest } = results[0];
+    if (!allowPeerRep) rest.peer_card = null;
+    const out = { ...rest, sessionId, scope: isPrivateRoom ? "private" : "public" };
+    extras.forEach(([, cfg], i) => { out[cfg.key] = results[i + 1]; });
+    return done(out);
   } catch (err) {
     return done({ ok: false, error: errorFromCatch(err) });
   }

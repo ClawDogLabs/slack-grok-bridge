@@ -52,6 +52,7 @@ import {
   botLabelSet,
   isSlackUserId,
   isSilentEvent,
+  privateChannelsOf,
 } from "../cloudflare-relay/src/honcho.js";
 
 export function loadLogEntries(dir) {
@@ -250,6 +251,7 @@ export async function backfillLogs(opts = {}) {
     const resolved = await resolveIngestChannel(eventFromRow(row), {
       allowlist,
       allowlistMode: "all",
+      privateChannels: privateChannelsOf(env),
       lookup: allowlist ? null : lookup,
       cache: channelCache,
     });

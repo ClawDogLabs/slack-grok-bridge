@@ -414,7 +414,7 @@ async function honchoForWake(env, e) {
   return honcho;
 }
 
-async function processInbound(env, c, kind, e, sayOnFail) {
+async function processInbound(env, c, kind, e, sayOnFail, extra = null) {
   if (isSilentEvent(env, e)) return;
   const channel = e.channel;
   const threadTs = e.thread_ts || e.ts;
@@ -431,6 +431,7 @@ async function processInbound(env, c, kind, e, sayOnFail) {
       reply: placement,
     };
     if (honchoReadEnabled(env)) payload.honcho = await honchoForWake(env, e);
+    if (extra && typeof extra === "object") Object.assign(payload, extra);
     await wakeGrok(env, payload);
     log("wake ok", kind, channel, e.ts);
     await clearThinking(env, channel, threadTs);
@@ -541,6 +542,225 @@ function scheduleHoncho(env, c, e) {
   });
 }
 
+// Sticky thread ownership. A human mention of only this bot marks the thread.
+// Later untagged human replies wake with sticky:true. Other tags wake with
+// sticky_other_tag and do not clear the mark. STICKY_THREADS=0/false/off disables.
+const STICKY_TTL_SECONDS = 7 * 24 * 3600;
+export function stickyEnabled(env) {
+  const v = String(env?.STICKY_THREADS ?? "1").toLowerCase();
+  return v !== "0" && v !== "false" && v !== "off";
+}
+export function taggedUserIds(text) {
+  return [...String(text || "").matchAll(/<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g)].map((m) => m[1]);
+}
+const stickyKey = (channel, root) => `sticky:${channel}:${root}`;
+export function stickyOp(e, c) {
+  if (!e || !c?.ownUserId || !e.channel) return { op: null };
+  const isApp = e.type === "app_mention";
+  if (!isApp && e.type !== "message") return { op: null };
+  if (!isApp && e.channel_type !== "channel" && e.channel_type !== "group") return { op: null };
+  if (String(e.channel).startsWith("D")) return { op: null };
+  if (e.bot_id || e.user === c.ownUserId || !e.user) return { op: null };
+  if (e.subtype && !FORWARD_SUBTYPES.has(e.subtype) && e.subtype !== "slack_audio") return { op: null };
+  const root = e.thread_ts || e.ts;
+  const tags = [...new Set(taggedUserIds(e.text))];
+  const hasMe = tags.includes(c.ownUserId);
+  const other = tags.some((u) => u !== c.ownUserId);
+  if (hasMe) return { op: other ? null : "set", root };
+  if (isApp) return { op: null };
+  if (e.thread_ts && e.thread_ts !== e.ts) return { op: "check", root, otherTag: other };
+  return { op: null };
+}
+async function applySticky(env, c, e) {
+  if (!stickyEnabled(env) || !env.PRIVROOM_STATE) return;
+  if (isSilentEvent(env, e)) return;
+  const { op, root, otherTag } = stickyOp(e, c);
+  if (!op) return;
+  const key = stickyKey(e.channel, root);
+  if (op === "set") {
+    await env.PRIVROOM_STATE.put(key, JSON.stringify({ by: e.user, at: Date.now() }), { expirationTtl: STICKY_TTL_SECONDS });
+    return log("sticky set", e.channel, root);
+  }
+  if (!(await env.PRIVROOM_STATE.get(key))) return;
+  log("sticky wake", e.channel, root, e.ts);
+  await processInbound(env, c, "app_mention", e, true, otherTag ? { sticky: true, sticky_other_tag: true } : { sticky: true });
+}
+
+// Private-room synthesize roster. Placeholder defaults match no real workspace.
+// PRIVROOM_BOTS JSON overrides: [{"name":"...","userId":"U...","botId":"B..."}].
+const DEFAULT_PRIVROOM_BOTS = [
+  { name: "Person", userId: "UPLACEHOLDER2", botId: "BPLACEHOLDER1" },
+  { name: "Valkyrie", userId: "UPLACEHOLDER3", botId: "BPLACEHOLDER2" },
+  { name: "Person", userId: "UPLACEHOLDER4", botId: "BPLACEHOLDER3" },
+  { name: "Person", userId: "UPLACEHOLDER5", botId: "BPLACEHOLDER4" },
+];
+export function privroomBotsOf(env) {
+  const raw = env?.PRIVROOM_BOTS;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return DEFAULT_PRIVROOM_BOTS;
+  let arr;
+  try { arr = JSON.parse(String(raw)); } catch { return []; }
+  if (!Array.isArray(arr)) return [];
+  return arr.filter((b) => b && b.name && (b.userId || b.botId)).map((b) => ({
+    name: String(b.name),
+    userId: b.userId ? String(b.userId) : "",
+    botId: b.botId ? String(b.botId) : "",
+  }));
+}
+function privroomDelaySeconds(env) {
+  const n = Number.parseInt(env?.PRIVROOM_DELAY_SECONDS ?? "300", 10);
+  return Number.isFinite(n) && n > 0 ? n : 300;
+}
+function privroomTags(env) {
+  const custom = String(env?.PRIVROOM_MENTION_TAGS || "").trim();
+  if (custom) return custom;
+  return privroomBotsOf(env).map((b) => b.userId).filter(Boolean).map((id) => `<@${id}>`).join(" ");
+}
+export function privroomSynthEnabled(env) {
+  const v = String(env?.PRIVROOM_SYNTHESIZE ?? "1").toLowerCase();
+  return v !== "0" && v !== "false" && v !== "off";
+}
+export function matchPrivroomBot(e, env) {
+  if (!e) return null;
+  for (const b of privroomBotsOf(env)) {
+    if (e.bot_id && b.botId && e.bot_id === b.botId) return b;
+    if (e.user && b.userId && e.user === b.userId) return b;
+  }
+  return null;
+}
+function privroomKey(channel, ts) {
+  return `privroom:${channel}:${ts}`;
+}
+function missingNameSlots(names, replied) {
+  const left = names.slice();
+  for (const name of replied || []) {
+    const i = left.indexOf(name);
+    if (i >= 0) left.splice(i, 1);
+  }
+  return left;
+}
+async function armPrivroomSynth(env, { channel, ts, invoker, question }) {
+  if (!privroomSynthEnabled(env)) return;
+  if (!env.PRIVROOM_STATE || !env.PRIVROOM_SYNTH) {
+    log("privroom synth skipped: missing PRIVROOM_STATE or PRIVROOM_SYNTH binding");
+    return;
+  }
+  const record = { channel, ts, invoker, question, replied: [], seen: [], synthesized: false, createdAt: Date.now() };
+  await env.PRIVROOM_STATE.put(privroomKey(channel, ts), JSON.stringify(record), { expirationTtl: 7200 });
+  await env.PRIVROOM_SYNTH.send({ channel, ts }, { delaySeconds: privroomDelaySeconds(env) });
+  log("privroom armed", channel, ts, `delay=${privroomDelaySeconds(env)}s`);
+}
+async function claimPrivroomSynth(env, channel, ts, reason) {
+  if (!env.PRIVROOM_STATE) return null;
+  const key = privroomKey(channel, ts);
+  const lockKey = `privroom:lock:${channel}:${ts}`;
+  if (await env.PRIVROOM_STATE.get(lockKey)) return null;
+  await env.PRIVROOM_STATE.put(lockKey, reason || "claimed", { expirationTtl: 7200 });
+  const raw = await env.PRIVROOM_STATE.get(key);
+  if (!raw) return null;
+  let rec;
+  try { rec = JSON.parse(raw); } catch { return null; }
+  if (rec.synthesized) return null;
+  rec.synthesized = true;
+  rec.synthesizedAt = Date.now();
+  rec.reason = reason || "unknown";
+  await env.PRIVROOM_STATE.put(key, JSON.stringify(rec), { expirationTtl: 7200 });
+  return rec;
+}
+export function buildPrivroomSynthPayload(env, rec, reason) {
+  const replied = Array.isArray(rec.replied) ? rec.replied : [];
+  const names = privroomBotsOf(env).map((b) => b.name);
+  return {
+    source: env.BRIDGE_SOURCE || env.source || "slack-bridge-example",
+    kind: "privroom_synthesize",
+    channel: rec.channel,
+    thread_ts: rec.ts,
+    question: rec.question,
+    invoker: rec.invoker,
+    replied,
+    missing: missingNameSlots(names, replied),
+    reason: reason || rec.reason || null,
+  };
+}
+async function firePrivroomSynthesize(env, rec, reason) {
+  const payload = buildPrivroomSynthPayload(env, rec, reason);
+  if (String(env.PRIVROOM_SYNTH_DRY_RUN || "") === "1") {
+    log("privroom synthesize DRY_RUN", reason, rec.channel, rec.ts);
+    return payload;
+  }
+  await wakeGrok(env, payload);
+  log("privroom synthesize wake", reason, rec.channel, rec.ts);
+  return payload;
+}
+async function tryPrivroomSynthesize(env, channel, ts, reason) {
+  if (!privroomSynthEnabled(env)) return false;
+  const rec = await claimPrivroomSynth(env, channel, ts, reason);
+  if (!rec) return false;
+  try {
+    await firePrivroomSynthesize(env, rec, reason);
+    return true;
+  } catch (err) {
+    log("privroom synthesize wake FAILED", reason, channel, ts, err?.message || err);
+    try {
+      await env.PRIVROOM_STATE.delete(`privroom:lock:${channel}:${ts}`);
+      const key = privroomKey(channel, ts);
+      const raw = await env.PRIVROOM_STATE.get(key);
+      if (raw) {
+        const row = JSON.parse(raw);
+        row.synthesized = false;
+        delete row.synthesizedAt;
+        delete row.reason;
+        await env.PRIVROOM_STATE.put(key, JSON.stringify(row), { expirationTtl: 7200 });
+      }
+    } catch { /* unlock is best-effort */ }
+    throw err;
+  }
+}
+async function onPrivroomBotReply(env, e, bot) {
+  if (!privroomSynthEnabled(env) || !env.PRIVROOM_STATE) return;
+  const threadTs = e.thread_ts;
+  if (!threadTs || threadTs === e.ts) return;
+  const key = privroomKey(e.channel, threadTs);
+  const raw = await env.PRIVROOM_STATE.get(key);
+  if (!raw) return;
+  let rec;
+  try { rec = JSON.parse(raw); } catch { return; }
+  if (rec.synthesized) return;
+  const seen = Array.isArray(rec.seen) ? rec.seen.slice() : [];
+  const id = `${bot.userId || ""}:${bot.botId || ""}`;
+  if (seen.includes(id)) return;
+  seen.push(id);
+  const names = privroomBotsOf(env).map((b) => b.name);
+  const replied = Array.isArray(rec.replied) ? rec.replied.slice() : [];
+  if (missingNameSlots(names, replied).includes(bot.name)) replied.push(bot.name);
+  rec.replied = replied;
+  rec.seen = seen;
+  await env.PRIVROOM_STATE.put(key, JSON.stringify(rec), { expirationTtl: 7200 });
+  log("privroom reply noted", bot.name, e.channel, threadTs);
+  if (missingNameSlots(names, replied).length === 0) {
+    await tryPrivroomSynthesize(env, e.channel, threadTs, "all_replied");
+  }
+}
+async function handleCommand(request, env, ctx) {
+  if (!env.SLACK_SIGNING_SECRET) return json({ ok: false, error: "signing secret not configured" }, 503);
+  const raw = await request.text();
+  const bad = await verifySlack(request, raw, env.SLACK_SIGNING_SECRET);
+  if (bad) return json({ ok: false, error: bad }, 401);
+  const f = new URLSearchParams(raw);
+  if (f.get("command") !== "/privroom") return json({ response_type: "ephemeral", text: "Unknown command" });
+  const text = (f.get("text") || "").trim();
+  if (!text) return json({ response_type: "ephemeral", text: "Usage: /privroom <question>" });
+  const channel = f.get("channel_id");
+  const user = f.get("user_id");
+  if (isSilentEvent(env, { channel })) return json({ response_type: "ephemeral", text: "This channel is muted." });
+  const msg = `${privroomTags(env)} from: <@${user}>. ${text}`.trim();
+  const r = await slackApi(env, "chat.postMessage", { channel, text: msg });
+  if (!r?.ok || !r.ts) return json({ response_type: "ephemeral", text: "Could not post." });
+  if (ctx && privroomSynthEnabled(env)) {
+    ctx.waitUntil(armPrivroomSynth(env, { channel, ts: r.ts, invoker: user, question: text }).catch((err) => log("privroom arm error", err?.message || err)));
+  }
+  return json({ response_type: "ephemeral", text: "Sent" });
+}
+
 async function handle(env, c, e, action) {
   if (isSilentEvent(env, e)) return;
   if (action === "welcome") return welcome(env, c, e);
@@ -562,8 +782,21 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-      return json({ ok: true, service: "slack-bridge-example", configured: !!(env.SLACK_SIGNING_SECRET && env.GROK_WEBHOOK_URL && env.SLACK_BOT_TOKEN) });
+      return json({
+        ok: true,
+        service: "slack-bridge-example",
+        configured: !!(env.SLACK_SIGNING_SECRET && env.GROK_WEBHOOK_URL && env.SLACK_BOT_TOKEN),
+        privroom_synthesize: privroomSynthEnabled(env),
+      });
     }
+    if (request.method === "POST" && url.pathname === "/internal/privroom-selftest") {
+      if (String(env.PRIVROOM_SELFTEST || "") !== "1") return json({ ok: false, error: "selftest disabled" }, 404);
+      const auth = request.headers.get("Authorization") || "";
+      const secret = env.GROK_WEBHOOK_SECRET || "";
+      if (!secret || auth !== `Bearer ${secret}`) return json({ ok: false, error: "unauthorized" }, 401);
+      return json({ ok: false, error: "selftest disabled" }, 404);
+    }
+    if (request.method === "POST" && url.pathname === "/slack/commands") return handleCommand(request, env, ctx);
     if (request.method !== "POST" || !(url.pathname === "/" || url.pathname === "/slack/events")) {
       return new Response("not found", { status: 404 });
     }
@@ -621,6 +854,30 @@ export default {
     const honchoTask = scheduleHoncho(env, c, e);
     if (action !== "ignore") ctx.waitUntil(handle(env, c, e, action).catch((err) => log("handler error", err?.message || err)));
     if (honchoTask) ctx.waitUntil(honchoTask);
+    if (stickyEnabled(env) && env.PRIVROOM_STATE && action === "ignore") {
+      ctx.waitUntil(applySticky(env, c, e).catch((err) => log("sticky error", err?.message || err)));
+    } else if (stickyEnabled(env) && env.PRIVROOM_STATE && e?.type === "app_mention") {
+      ctx.waitUntil(applySticky(env, c, e).catch((err) => log("sticky error", err?.message || err)));
+    }
+    if (privroomSynthEnabled(env) && e && e.type === "message" && e.thread_ts && e.thread_ts !== e.ts) {
+      const bot = matchPrivroomBot(e, env);
+      if (bot) ctx.waitUntil(onPrivroomBotReply(env, e, bot).catch((err) => log("privroom reply error", err?.message || err)));
+    }
     return json({ ok: true }, 200, { "X-Relay-Action": `${action}:${reason}` });
+  },
+
+  async queue(batch, env) {
+    for (const msg of batch.messages) {
+      try {
+        if (!privroomSynthEnabled(env)) { msg.ack(); continue; }
+        const body = msg.body || {};
+        if (!body.channel || !body.ts) { msg.ack(); continue; }
+        await tryPrivroomSynthesize(env, body.channel, body.ts, "timer");
+        msg.ack();
+      } catch (err) {
+        log("privroom queue error", err?.message || err);
+        msg.retry();
+      }
+    }
   },
 };

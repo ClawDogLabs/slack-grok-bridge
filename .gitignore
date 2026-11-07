@@ -5,6 +5,7 @@ node_modules/
 bridge.pid
 bridge.log
 bridge.child.pid
+voice/.venv/
 
 # Local voice/log/status files. Commit the examples, not a live copy.
 __pycache__/
