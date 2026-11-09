@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import worker, {
   assistantGreetingOf,
   assistantPromptsOf,
+  routeSurface,
   slackSignature,
   suggestedPromptsArgs,
   viewedContextOf,
@@ -155,6 +156,11 @@ test("an assistant-thread DM wakes with thread_ts, context, and a cleared thinki
   assert.equal(wake.body.assistant.thread_ts, THREAD);
   assert.equal(wake.body.assistant.context.channel_id, VIEW);
   assert.equal(wake.body.assistant.context.enterprise_id, "EPLACEHOLDER1");
+  assert.equal(wake.body.routing.surface, "assistant_thread");
+  assert.equal(wake.body.routing.panel, true);
+  assert.equal(wake.body.routing.provenance, "assistant_thread_record");
+  assert.equal(wake.body.routing.reply_thread_ts, THREAD);
+  assert.equal(wake.body.routing.reply_broadcast, false);
   const statuses = calls.filter((c) => c.url.includes("assistant.threads.setStatus"));
   assert.equal(statuses[0].body.channel_id, DM);
   assert.equal(statuses[0].body.thread_ts, THREAD);
@@ -180,6 +186,27 @@ test("an ordinary DM stays top-level and does not pick up assistant context", as
   assert.equal(wake.body.reply.thread_ts, null);
   assert.equal(wake.body.assistant, undefined);
   assert.equal(wake.body.slack.thread_ts, undefined);
+  assert.equal(wake.body.routing.surface, "im");
+  assert.equal(wake.body.routing.panel, false);
+  assert.equal(wake.body.routing.reply_thread_ts, null);
+  assert.equal(wake.body.routing.reply_broadcast, false);
+  assert.equal(wake.body.routing.context, null);
+});
+
+test("a plain DM thread stays in that thread and is not the panel", async () => {
+  const s = kv(); calls = [];
+  await send(baseEnv(s), {
+    type: "message", channel_type: "im", channel: DM, user: "UHUMAN", text: "inside", ts: "240.5", thread_ts: "240.1",
+  });
+  const wake = calls.find((c) => c.url.startsWith("https://grok.test"));
+  assert.equal(wake.body.routing.surface, "im_thread");
+  assert.equal(wake.body.routing.panel, false);
+  assert.equal(wake.body.routing.provenance, "incoming_thread");
+  assert.equal(wake.body.routing.reply_thread_ts, "240.1");
+  assert.equal(wake.body.reply.thread_ts, "240.1");
+  assert.equal(wake.body.routing.reply_broadcast, false);
+  assert.equal(wake.body.routing.context, null);
+  assert.equal(wake.body.assistant, undefined);
 });
 
 test("a bot message in an assistant thread does not wake", async () => {
@@ -201,24 +228,80 @@ test("a bot message in an assistant thread does not wake", async () => {
   assert.equal(calls.some((c) => c.url.includes("setStatus")), false);
 });
 
-test("app_context_changed is stored for the authorized user and attached on the next thread reply", async () => {
+test("app_context_changed does not mark a later DM thread as the panel", async () => {
   const s = kv(); calls = [];
   await send(baseEnv(s), {
     type: "app_context_changed",
     context: { entities: [{ type: "slack#/types/channel_id", value: "CPLACEHOLDER7", team_id: "TPLACEHOLDER3" }] },
   }, { authorizations: [{ user_id: "UHUMAN", is_bot: false }] });
   assert.equal(calls.length, 0);
+  assert.equal([...s.m.keys()].some((k) => String(k).includes("UHUMAN")), false);
   calls = [];
   await send(baseEnv(s), {
     type: "message", channel_type: "im", channel: DM, user: "UHUMAN", text: "what about this channel?", ts: "210.5", thread_ts: "210.1",
   });
   const wake = calls.find((c) => c.url.startsWith("https://grok.test"));
-  assert.equal(wake.body.reply.thread_ts, "210.1");
-  assert.equal(wake.body.assistant.context.channel_id, "CPLACEHOLDER7");
-  assert.equal(JSON.parse(s.m.get(`assistant:${DM}:210.1`)).context.channel_id, "CPLACEHOLDER7");
+  assert.equal(wake.body.routing.surface, "im_thread");
+  assert.equal(wake.body.routing.panel, false);
+  assert.equal(wake.body.routing.context, null);
+  assert.equal(wake.body.routing.reply_broadcast, false);
+  assert.equal(wake.body.assistant, undefined);
+  assert.equal(s.m.has(`assistant:${DM}:210.1`), false);
 });
 
-test("message.im context is passed through on a top-level DM without changing reply placement", async () => {
+test("a stale per-user record and an unmarked thread record do not become the panel", async () => {
+  const s = kv(); calls = [];
+  s.m.set("assistant-user:UHUMAN", JSON.stringify({ context: { channel_id: "CPLACEHOLDER7" }, user_id: "UHUMAN" }));
+  s.m.set(`assistant:${DM}:210.1`, JSON.stringify({
+    context: { channel_id: "CPLACEHOLDER8" }, channel_id: DM, thread_ts: "210.1",
+  }));
+  await send(baseEnv(s), {
+    type: "message", channel_type: "im", channel: DM, user: "UHUMAN", text: "plain thread", ts: "210.5", thread_ts: "210.1",
+  });
+  const wake = calls.find((c) => c.url.startsWith("https://grok.test"));
+  assert.equal(wake.body.routing.surface, "im_thread");
+  assert.equal(wake.body.routing.panel, false);
+  assert.equal(wake.body.routing.context, null);
+  assert.equal(wake.body.assistant, undefined);
+  assert.equal(JSON.stringify(wake.body).includes("CPLACEHOLDER7"), false);
+  assert.equal(JSON.stringify(wake.body).includes("CPLACEHOLDER8"), false);
+});
+
+test("context changed before the start still names that thread only", async () => {
+  const s = kv(); calls = [];
+  await send(baseEnv(s), {
+    type: "assistant_thread_context_changed",
+    assistant_thread: { user_id: "UHUMAN", channel_id: DM, thread_ts: THREAD, context: { channel_id: "CPLACEHOLDER8" } },
+  });
+  await send(baseEnv(s), {
+    type: "assistant_thread_started",
+    assistant_thread: { user_id: "UHUMAN", channel_id: DM, thread_ts: THREAD },
+  });
+  assert.equal(calls.filter((c) => c.url.includes("chat.postMessage")).length, 1);
+  calls = [];
+  await send(baseEnv(s), {
+    type: "message", channel_type: "im", channel: DM, user: "UHUMAN", text: "in the panel", ts: "200.5", thread_ts: THREAD,
+  });
+  await send(baseEnv(s), {
+    type: "message", channel_type: "im", channel: DM, user: "UHUMAN", text: "other thread", ts: "211.5", thread_ts: "211.1",
+  });
+  const wakes = calls.filter((c) => c.url.startsWith("https://grok.test"));
+  assert.equal(wakes[0].body.routing.surface, "assistant_thread");
+  assert.equal(wakes[0].body.routing.context.channel_id, "CPLACEHOLDER8");
+  assert.equal(wakes[0].body.routing.reply_broadcast, false);
+  assert.equal(wakes[1].body.routing.surface, "im_thread");
+  assert.equal(wakes[1].body.routing.context, null);
+  assert.equal(wakes[1].body.assistant, undefined);
+});
+
+test("a repeated assistant_thread_started greets once", async () => {
+  const s = kv(); calls = [];
+  await send(baseEnv(s), started());
+  await send(baseEnv(s), started());
+  assert.equal(calls.filter((c) => c.url.includes("chat.postMessage")).length, 1);
+});
+
+test("a top-level agent message with context is still a main DM", async () => {
   const s = kv(); calls = [];
   await send(baseEnv(s), {
     type: "message",
@@ -230,9 +313,23 @@ test("message.im context is passed through on a top-level DM without changing re
     app_context: { entities: [{ type: "slack#/types/channel_id", value: VIEW, team_id: "TPLACEHOLDER1" }] },
   });
   const wake = calls.find((c) => c.url.startsWith("https://grok.test"));
+  assert.equal(wake.body.routing.surface, "im");
+  assert.equal(wake.body.routing.panel, false);
+  assert.equal(wake.body.routing.provenance, "top_level");
+  assert.equal(wake.body.routing.reply_thread_ts, null);
+  assert.equal(wake.body.routing.reply_broadcast, false);
+  assert.equal(wake.body.routing.viewed.channel_id, VIEW);
+  assert.equal(wake.body.routing.viewed_source, "event");
   assert.equal(wake.body.reply.thread_ts, null);
-  assert.equal(wake.body.assistant.thread_ts, null);
-  assert.equal(wake.body.assistant.context.channel_id, VIEW);
+  assert.equal(wake.body.assistant, undefined);
+  assert.equal(s.m.has(`assistant:${DM}:220.1`), false);
+});
+
+test("an assistant_thread_started without a thread id does not invent one", async () => {
+  const s = kv(); calls = [];
+  await send(baseEnv(s), started({ thread_ts: undefined }));
+  assert.equal(calls.length, 0);
+  assert.equal(s.m.size, 0);
 });
 
 test("messages-tab open sets prompts and greets once; the home tab does neither", async () => {
@@ -266,6 +363,34 @@ test("a muted assistant DM does not greet, and the panel switch disables it", as
   const wake = calls.find((c) => c.url.startsWith("https://grok.test"));
   assert.equal(wake.body.reply.thread_ts, THREAD);
   assert.equal(wake.body.assistant, undefined);
+});
+
+test("channel and group-DM routes do not borrow the 1:1 rule", async () => {
+  const env = {
+    OWN_USER_ID: BOT,
+    PRIVROOM_BOTS: JSON.stringify([{ name: "BotB", userId: "UPLACEHOLDER2", botId: "BPLACEHOLDER1" }]),
+  };
+  const first = await routeSurface(env, {
+    type: "app_mention", channel: "CPLACEHOLDER4", channel_type: "channel", user: "UHUMAN", text: `<@${BOT}> hi`, ts: "1.1",
+  });
+  assert.equal(first.surface, "channel");
+  assert.equal(first.reply_broadcast, true);
+  assert.equal(first.reply_thread_ts, "1.1");
+  const follow = await routeSurface(env, {
+    type: "message", channel: "CPLACEHOLDER4", channel_type: "channel", user: "UHUMAN", text: `<@${BOT}> again`, ts: "1.5", thread_ts: "1.1",
+  });
+  assert.equal(follow.reply_broadcast, false);
+  assert.equal(follow.reply_thread_ts, "1.1");
+  const multi = await routeSurface(env, {
+    type: "app_mention", channel: "CPLACEHOLDER4", channel_type: "channel", user: "UHUMAN", text: `<@${BOT}> <@UPLACEHOLDER2> both`, ts: "2.1",
+  });
+  assert.equal(multi.reply_broadcast, false);
+  const mpim = await routeSurface(env, {
+    type: "message", channel: "GPLACEHOLDER1", channel_type: "mpim", user: "UHUMAN", text: "hi", ts: "3.1",
+  });
+  assert.equal(mpim.surface, "mpim");
+  assert.equal(mpim.reply_thread_ts, null);
+  assert.equal(mpim.reply_broadcast, false);
 });
 
 test("legacy containers can pin prompts to the assistant thread", async () => {

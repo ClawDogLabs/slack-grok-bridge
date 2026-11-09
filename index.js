@@ -486,8 +486,16 @@ async function processInbound({ kind, event, client, logger, sayOnFail }) {
       reply: fields,
     };
     try {
-      const assistant = await assistantForWake(process.env, enriched);
-      if (assistant) payload.assistant = assistant;
+      const api = await loadAssistantApi();
+      const routing = await api.routeSurface({ ...process.env, PRIVROOM_STATE: assistantKv }, enriched);
+      if (routing) payload.routing = routing;
+      if (routing?.panel) {
+        payload.assistant = {
+          thread_ts: routing.reply_thread_ts,
+          channel_id: enriched.channel,
+          context: routing.context,
+        };
+      }
     } catch (err) {
       logger?.warn?.("assistant context", err?.message || err);
     }

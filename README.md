@@ -136,15 +136,11 @@ Other knobs: `THINKING_TIMEOUT_MS` (default 45000 safety clear), `BRIDGE_SOURCE`
 
 ## Threading
 
-The Socket Mode bridge and both HTTP relays apply the placement below to messages **they** post (a hold-ack, a welcome, a record-search reply). They copy that decision onto the webhook as `reply: { thread_ts, reply_broadcast }`. For a top-level 1:1, that hint is still `thread_ts: null` and `reply_broadcast: false`. The routine does not have to post the answer that way.
+The Socket Mode bridge and both HTTP relays apply the placement below to messages **they** post (a hold-ack, a welcome, a record-search reply). They copy that decision onto the webhook as `reply`. Follow `routing` for the answer. `reply` can still say `reply_broadcast: true` on a channel follow-up; `routing.reply_broadcast` is the rule.
 
-**1:1 DMs and the agent panel** (`channel_type` `im`) are routine policy. Choose `thread_ts` in this order:
+**1:1 DMs** (`routing.surface` `im` or `im_thread`). A top-level ask has `routing.reply_thread_ts` null. Post in the main DM and omit `thread_ts`. A message that already has a parent thread (`slack.thread_ts` different from `slack.ts`) has `routing.surface` `im_thread` and `routing.reply_thread_ts` set to that parent. Answer only in that thread. Do not set `reply_broadcast` on either, including a delayed result. Post the delayed result on the same route: main DM, or that same thread. Do not also post a second copy.
 
-1. `reply.thread_ts`, when the webhook set it
-2. otherwise `slack.thread_ts`, when it is set and different from `slack.ts`
-3. otherwise `slack.ts`
-
-Every top-level ask therefore starts a topic thread rooted at that message. Later replies and in-progress notes stay in that thread and omit `reply_broadcast`. The one opt-in exception is the delayed **final** completion of a long job: post it on the same topic `thread_ts` with `reply_broadcast: true` so Slack can also show that one reply in the main DM. Progress messages do not use the flag. Slack's `chat.postMessage` docs describe `reply_broadcast` as optional, used only together with `thread_ts`, and as making the reply visible in the channel or conversation. They do not document a separate 1:1 prohibition.
+**Agent panel.** `routing.surface` is `assistant_thread` only when Slack named that pair. The naming events are `assistant_thread_started` and `assistant_thread_context_changed` (`assistant_thread.channel_id` and `assistant_thread.thread_ts`). A message that itself carries `assistant_thread` for the same pair counts too. Answer in `routing.reply_thread_ts` and do not broadcast. The relay does not copy `app_context_changed` onto a later DM. A top-level `message.im` on the current agent Messages tab usually has no thread id and no `assistant_thread` field, so it is indistinguishable from an ordinary main DM. The relay then sets `surface` to `im` and does not claim a panel thread. `routing.viewed` is present only when that same event included `app_context` or `context`. It is not panel memory and is not reused on the next message.
 
 **Group DMs** (`mpim`) stay as they are. Post at the top level unless `slack.thread_ts` is set and different from `slack.ts`. Do not set `reply_broadcast`.
 
@@ -153,11 +149,11 @@ Every top-level ask therefore starts a topic thread rooted at that message. Late
 - First answer to a human ask that @mentions exactly one bot: `thread_ts` is the parent, or `slack.ts` when this message started the thread, and `reply_broadcast: true`.
 - An ask that @mentions more than one bot: stay in the thread. Omit `reply_broadcast`.
 - A follow-up (`slack.thread_ts` set and different from `slack.ts`), including a later single-bot mention in that thread: stay in the thread.
-- Exception: a wake with `kind: "privroom_synthesize"`. That combined reply may set `reply_broadcast: true` even though the original ask named more than one bot. It is not a 1:1 topic, so do not apply the 1:1 precedence to it.
+- Exception: a wake with `kind: "privroom_synthesize"`. That combined reply may set `reply_broadcast: true` even though the original ask named more than one bot. Do not treat it as a 1:1.
 
 `app_mention` often has no `channel_type`. The bridge calls `conversations.info` to tell a group DM from a channel. That needs the matching read scope (`channels:read`, `groups:read`, `im:read`, or `mpim:read`). If the lookup fails, the mention is treated as a channel.
 
-File uploads cannot set `reply_broadcast`. Upload into the thread, then post a separate short message with `reply_broadcast` only for that first single-bot channel answer, the private-room synthesis reply, or the opt-in 1:1 final note. See [`voice/README.md`](voice/README.md).
+File uploads cannot set `reply_broadcast`. Upload into the thread when `routing.reply_thread_ts` is set, and omit `--thread-ts` for a top-level 1:1. Post a separate short message with `reply_broadcast` only for the first single-bot channel answer or the private-room synthesis reply. Do not broadcast a 1:1 or panel upload. See [`voice/README.md`](voice/README.md).
 
 Invite the bot into channels with `/invite @YourBotDisplayName`.
 
