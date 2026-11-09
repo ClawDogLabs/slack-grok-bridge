@@ -130,20 +130,29 @@ The text hold-ack is **opt-in** (`HOLD_ACK=true`). Leave it off unless you also 
 - Generic: "Got it - checking with the owner and will get back to you."
 - Personal/family heuristic (kids, schedule, school, address, etc.): "That's not on my approved list of things to share publicly. Let me check with the owner and get back to you."
 
-That text follows the [threading rule](#threading). `HOLD_ACK_BROADCAST` (default true) controls whether a **channel** hold-ack is also sent to the channel. DMs are never broadcast.
+That text follows the relay's own placement, not the routine's topic rule below. `HOLD_ACK_BROADCAST` (default true) controls whether a **channel** hold-ack is also sent to the channel. The relay does not set `reply_broadcast` on a DM hold-ack.
 
 Other knobs: `THINKING_TIMEOUT_MS` (default 45000 safety clear), `BRIDGE_SOURCE` (payload `source` field). The HTTP relays use the same acknowledgement. A later `chat.postMessage` is the real answer and needs `chat:write`.
 
 ## Threading
 
-Replies land in a different place in DMs than in channels. The Socket Mode bridge and both HTTP relays apply this to messages they post themselves, and they send the same decision on the webhook as `reply: { thread_ts, reply_broadcast }`. `thread_ts` is null when the reply should be top-level. The routine template follows `reply` when it posts.
+The Socket Mode bridge and both HTTP relays apply the placement below to messages **they** post (a hold-ack, a welcome, a record-search reply). They copy that decision onto the webhook as `reply: { thread_ts, reply_broadcast }`. For a top-level 1:1, that hint is still `thread_ts: null` and `reply_broadcast: false`. The routine does not have to post the answer that way.
 
-- **DMs and group DMs:** a normal message. Set `thread_ts` only when the inbound message is already in a thread (`thread_ts` present and different from `ts`). Do not set `reply_broadcast`.
-- **Channels:** reply in the thread (`thread_ts` is the parent, or the message `ts` if it started the thread) and set **`reply_broadcast: true`** so the channel sees it. That flag is per message, not a manifest setting.
+**1:1 DMs and the agent panel** (`channel_type` `im`) are routine policy. Choose `thread_ts` in this order:
+
+1. `reply.thread_ts`, when the webhook set it
+2. otherwise `slack.thread_ts`, when it is set and different from `slack.ts`
+3. otherwise `slack.ts`
+
+Every top-level ask therefore starts a topic thread rooted at that message. Later replies and in-progress notes stay in that thread and omit `reply_broadcast`. The one opt-in exception is the delayed **final** completion of a long job: post it on the same topic `thread_ts` with `reply_broadcast: true` so Slack can also show that one reply in the main DM. Progress messages do not use the flag. Slack's `chat.postMessage` docs describe `reply_broadcast` as optional, used only together with `thread_ts`, and as making the reply visible in the channel or conversation. They do not document a separate 1:1 prohibition.
+
+**Group DMs** (`mpim`) stay as they are. Post at the top level unless `slack.thread_ts` is set and different from `slack.ts`. Do not set `reply_broadcast`.
+
+**Channels** stay as they are, including a private channel the relay already treats as a channel. `thread_ts` is the parent, or `slack.ts` when this message started the thread, and `reply_broadcast: true` so that one bot's reply is also visible in the channel. A private-room synthesize wake is not a 1:1 topic. Do not apply the 1:1 precedence to it.
 
 `app_mention` often has no `channel_type`. The bridge calls `conversations.info` to tell a group DM from a channel. That needs the matching read scope (`channels:read`, `groups:read`, `im:read`, or `mpim:read`). If the lookup fails, the mention is treated as a channel.
 
-File uploads cannot set `reply_broadcast`. Upload into the thread, then post a separate short message with `reply_broadcast` when the channel should see it. See [`voice/README.md`](voice/README.md).
+File uploads cannot set `reply_broadcast`. Upload into the thread, then post a separate short message with `reply_broadcast` when a channel should see it, or for that opt-in 1:1 final note. See [`voice/README.md`](voice/README.md).
 
 Invite the bot into channels with `/invite @YourBotDisplayName`.
 
@@ -163,7 +172,7 @@ Phase A writes public-channel Slack messages to [Honcho](https://honcho.dev) aft
 
 The HTTP relay (Cloudflare Worker and `node-http-relay`, the same module) has a separate switch, `HONCHO_READ`, default off. When it is on, the wake handlers fetch that channel's session context and attach `payload.honcho` before the webhook. A failed or slow read still wakes (`honcho.ok === false`). Socket Mode stays write-only.
 
-`HONCHO_INGEST` defaults off (`0` / unset / `false`). Set it to `1` only after the checklist in the relay README. `HONCHO_API_KEY` is a secret (wrangler secret or `.env`, never committed). `HONCHO_WORKSPACE_ID` defaults to `slack-workspace`.
+Honcho is entirely optional. `HONCHO_INGEST` and `HONCHO_READ` both default off (`0` / unset / `false`). Leave them off and do not set `HONCHO_API_KEY` until you turn one of them on. The key is a secret (wrangler secret or `.env`, never committed) and is used only while ingest or read is enabled. `HONCHO_WORKSPACE_ID` defaults to `slack-workspace`.
 
 Scope is public channels (`channel_type` `channel`). DMs (`im`), group DMs (`mpim`), and private channels (`group`) are dropped. A channel id that starts with `C` is not enough: group DMs can use those ids too. When `channel_type` is missing, `HONCHO_CHANNEL_IDS` (comma-separated public channel ids) is the allowlist. Otherwise a working `conversations.info` lookup is used. If that call cannot classify (`missing_scope` until `channels:read` is granted), the row is skipped. The same personal-term hold as `looksPersonal()` / the owner share policy drops family, schedule, address, phone, and email text. Tokens, key URLs, street addresses, and financial account numbers are dropped too. Empty and bot-noise subtypes are skipped. The bot's own public-channel replies are kept. A log label listed in `BOT_NAME` is stored under `OWN_USER_ID`, never as that label.
 

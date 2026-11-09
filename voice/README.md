@@ -58,7 +58,7 @@ python3 speak_reply.py --text "On it." --out /tmp/reply.mp3
 | `--topic` | first sentence of the text | Clip topic. The file **title** is this topic, clipped to 80 characters. |
 | `--title` | | Exact title. Overrides `--topic`. |
 | `--comment` | none | `initial_comment` on the Slack file |
-| `--thread-ts` | none | Share into this thread. Omit for a top-level DM or channel message. |
+| `--thread-ts` | none | Share into this thread. For a 1:1, pass the topic root (`reply.thread_ts`, else `slack.thread_ts`, else `slack.ts`). Omit only for a group DM or channel message that is not in a thread. |
 | `--channel` | none | Slack channel id from the webhook. Omit, with `--out`, to render an mp3 and not upload. |
 | `--broadcast` | off | Also post a short channel-visible note. See below. |
 | `--broadcast-text` | comment, or `Voice reply: <title>` | Body of that note |
@@ -71,11 +71,11 @@ The filename is a slug of the title plus `.mp3`.
 
 When the [threading rule](../README.md#threading) says a channel reply should also show in the channel, pass `--broadcast`. The script uploads the audio (with `--thread-ts` when there is one) and then posts a **separate** `chat.postMessage` in that thread with `reply_broadcast: true`. The note is the comment, or `Voice reply: <title>`, unless you set `--broadcast-text`. It does not paste the whole script into the channel.
 
-In a DM, leave `--broadcast` off and omit `--thread-ts` unless the inbound message was already in a thread. `reply_broadcast` is a channel-thread flag; the script skips the extra message when there is no `--thread-ts`.
+For a 1:1, pass `--thread-ts` so the audio is in the topic, and leave `--broadcast` off. The upload API has no `reply_broadcast` parameter. The script's extra note is a separate `chat.postMessage`, and it skips that note when there is no `--thread-ts`. Pass `--broadcast` on a 1:1 only for an opt-in delayed final completion, not for ordinary progress. Group DMs do not use `--broadcast`.
 
 ## What the routine should do
 
 1. If the webhook `slack.files` entry is audio (`mimetype` starts with `audio/`, or a voice clip), run `transcribe.py --file-id <id>` and treat the stdout as the user's words.
 2. Log the file id and mimetype with the rest of the message. See [../docs/MESSAGE_LOG.md](../docs/MESSAGE_LOG.md). Do not log `url_private` or the bot token.
-3. If a spoken reply is appropriate, write the reply text to a temp file and run `speak_reply.py` with `--topic` set from what the clip was about, `--channel` from the event, and `--thread-ts` only when `reply.thread_ts` in the webhook payload is set.
-4. For a channel, add `--broadcast` so the channel sees a one-line note. The audio itself is the thread reply.
+3. If a spoken reply is appropriate, write the reply text to a temp file and run `speak_reply.py` with `--topic` set from what the clip was about, `--channel` from the event, and `--thread-ts` from the 1:1 precedence in the [threading rule](../README.md#threading) (or, in a group DM, only when the message is already in a thread).
+4. For a channel, add `--broadcast` so the channel sees a one-line note. The audio itself is the thread reply. Do not add `--broadcast` for an ordinary 1:1.
