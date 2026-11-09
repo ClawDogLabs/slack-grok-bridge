@@ -684,6 +684,30 @@ export function privroomSynthEnabled(env) {
   const v = String(env?.PRIVROOM_SYNTHESIZE ?? "1").toLowerCase();
   return v !== "0" && v !== "false" && v !== "off";
 }
+const DEFAULT_PRIVROOM_COMMAND = "/privroom";
+const PRIVROOM_COMMAND_RE = /^\/[a-z0-9_-]{1,32}$/;
+/**
+ * Accepted slash commands. Unset, blank, or all-invalid PRIVROOM_COMMANDS
+ * means only /privroom. A comma-separated list adds aliases. /privroom always
+ * stays accepted. Tokens that are not /name (letters, digits, _ or -) are dropped.
+ */
+export function privroomCommandsOf(env) {
+  const accepted = [DEFAULT_PRIVROOM_COMMAND];
+  const raw = env?.PRIVROOM_COMMANDS;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return accepted;
+  for (const part of String(raw).split(",")) {
+    let name = part.trim().toLowerCase();
+    if (!name) continue;
+    if (!name.startsWith("/")) name = `/${name}`;
+    if (!PRIVROOM_COMMAND_RE.test(name) || accepted.includes(name)) continue;
+    accepted.push(name);
+  }
+  return accepted;
+}
+export function privroomCommandAccepted(env, command) {
+  const name = String(command || "").trim().toLowerCase();
+  return privroomCommandsOf(env).includes(name);
+}
 export function matchPrivroomBot(e, env) {
   if (!e) return null;
   for (const b of privroomBotsOf(env)) {
@@ -811,9 +835,11 @@ async function handleCommand(request, env, ctx) {
   const bad = await verifySlack(request, raw, env.SLACK_SIGNING_SECRET);
   if (bad) return json({ ok: false, error: bad }, 401);
   const f = new URLSearchParams(raw);
-  if (f.get("command") !== "/privroom") return json({ response_type: "ephemeral", text: "Unknown command" });
+  const command = f.get("command");
+  if (!privroomCommandAccepted(env, command)) return json({ response_type: "ephemeral", text: "Unknown command" });
   const text = (f.get("text") || "").trim();
-  if (!text) return json({ response_type: "ephemeral", text: "Usage: /privroom <question>" });
+  const shown = String(command || DEFAULT_PRIVROOM_COMMAND).trim().toLowerCase();
+  if (!text) return json({ response_type: "ephemeral", text: `Usage: ${shown} <question>` });
   const channel = f.get("channel_id");
   const user = f.get("user_id");
   if (isSilentEvent(env, { channel })) return json({ response_type: "ephemeral", text: "This channel is muted." });

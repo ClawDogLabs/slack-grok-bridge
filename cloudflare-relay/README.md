@@ -171,6 +171,12 @@ Deploy the mute (do this only when you intend to ship; this repo does not deploy
 
 `node-http-relay` imports this module, so the same variable mutes there too. Socket Mode checks the variable at the start of `app_mention` and `message`, before thinking status. The live host is the Worker.
 
+## Private-room slash command
+
+`POST /slack/commands` accepts `/privroom`. `PRIVROOM_COMMANDS` is an optional comma-separated list of extra names, for example `/sample-ask,/sample-ask-2`. `/privroom` stays accepted. A blank value, or a value whose tokens are all invalid, adds nothing. A token must be `/` plus 1–32 letters, digits, underscores, or hyphens. Anything else is dropped.
+
+An accepted command with text posts `PRIVROOM_MENTION_TAGS`, or `<@userId>` from `PRIVROOM_BOTS` when that string is unset, plus the question, in the channel Slack sent. A muted channel gets an ephemeral reply and no post. The Worker stores `privroom:<channel>:<ts>` and enqueues `PRIVROOM_SYNTH` for `PRIVROOM_DELAY_SECONDS` (default 300). The first of “every configured bot replied” or the timer wakes once with `kind: "privroom_synthesize"`. Fields are `source`, `kind`, `channel`, `thread_ts`, `question`, `invoker`, `replied`, `missing`, and `reason` (`all_replied` or `timer`). That kind is generic. It is not a room name.
+
 ## Thread ownership
 
 A thread this bot owns wakes on a later human reply that does not @mention anyone. Two starts create that ownership, both stored in `PRIVROOM_STATE` for 7 days (`sticky:<channel>:<root ts>`):
