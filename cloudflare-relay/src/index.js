@@ -28,6 +28,12 @@
  * threading rule: plain in DMs/group DMs unless already threaded; thread +
  * reply_broadcast in channels. The same placement is sent as `reply` on the webhook.
  *
+ * Assistant / agent panel: assistant_thread_started posts ASSISTANT_GREETING and
+ * sets suggested prompts. assistant_thread_context_changed (and app_context_changed)
+ * stores the viewed channel on PRIVROOM_STATE. A DM that already has a parent
+ * thread_ts wakes with that thread_ts and payload.assistant. A DM with no
+ * thread_ts stays top-level. ASSISTANT_PANEL=0 disables the panel extras.
+ *
  * Every request is answered fast (200 within ms); slow work runs in ctx.waitUntil so Slack's
  * 3-second deadline is never at risk.
  */
@@ -434,6 +440,11 @@ async function processInbound(env, c, kind, e, sayOnFail, extra = null) {
       reply: placement,
     };
     if (honchoReadEnabled(env)) payload.honcho = await honchoForWake(env, e);
+    const assistant = await assistantForWake(env, e).catch((err) => {
+      log("assistant context", err?.message || err);
+      return null;
+    });
+    if (assistant) payload.assistant = assistant;
     if (extra && typeof extra === "object") Object.assign(payload, extra);
     await wakeGrok(env, payload);
     log("wake ok", kind, channel, e.ts);
@@ -526,7 +537,10 @@ async function deliverRecordSearch(env, event, decision) {
   if (isSilentEvent(env, event) || dm === decision.channelId) return;
   const result = await queryRecordSession(env, { source: "slack-im", event });
   const text = formatRecordReply(result, { label: decision.channelId });
-  await slackApi(env, "chat.postMessage", { channel: dm, text });
+  const post = { channel: dm, text };
+  const parent = assistantParentTs(event);
+  if (parent) post.thread_ts = parent;
+  await slackApi(env, "chat.postMessage", post);
   log("record search posted", decision.channelId, decision.requesterId, result.ok ? (result.messages || []).length : (result.error || "fail"));
 }
 
@@ -801,6 +815,210 @@ async function handleCommand(request, env, ctx) {
   return json({ response_type: "ephemeral", text: "Sent" });
 }
 
+// Assistant / agent panel. Greeting and prompts are config; nothing here is a
+// workspace name. Suggested prompts omit thread_ts unless
+// ASSISTANT_PROMPTS_IN_THREAD=1, because an agent app silently drops the call
+// when thread_ts is present. Legacy assistant containers can opt in.
+const DEFAULT_ASSISTANT_GREETING = "Hi. Ask a question, or choose a prompt.";
+const DEFAULT_ASSISTANT_PROMPTS_TITLE = "Try one of these";
+const DEFAULT_ASSISTANT_PROMPTS = [
+  { title: "Ask a question", message: "What can you help me with?" },
+  { title: "Summarize the channel", message: "Summarize what I should know from the channel I am viewing." },
+];
+const ASSISTANT_CONTEXT_TTL_SECONDS = 30 * 24 * 3600;
+
+export function assistantPanelEnabled(env) {
+  const v = String(env?.ASSISTANT_PANEL ?? "1").toLowerCase();
+  return v !== "0" && v !== "false" && v !== "off";
+}
+export function assistantGreetingOf(env) {
+  if (env?.ASSISTANT_GREETING === undefined || env?.ASSISTANT_GREETING === null) return DEFAULT_ASSISTANT_GREETING;
+  const text = String(env.ASSISTANT_GREETING).trim();
+  if (!text || /^(off|false|none|0)$/i.test(text)) return "";
+  return text;
+}
+export function assistantPromptsTitleOf(env) {
+  const text = String(env?.ASSISTANT_PROMPTS_TITLE ?? "").trim();
+  return text || DEFAULT_ASSISTANT_PROMPTS_TITLE;
+}
+export function assistantPromptsOf(env) {
+  const raw = env?.ASSISTANT_PROMPTS;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return DEFAULT_ASSISTANT_PROMPTS.map((p) => ({ ...p }));
+  let arr;
+  try { arr = JSON.parse(String(raw)); } catch { return DEFAULT_ASSISTANT_PROMPTS.map((p) => ({ ...p })); }
+  if (!Array.isArray(arr)) return DEFAULT_ASSISTANT_PROMPTS.map((p) => ({ ...p }));
+  const prompts = [];
+  for (const p of arr) {
+    if (!p || !p.title || !p.message) continue;
+    prompts.push({ title: String(p.title), message: String(p.message) });
+    if (prompts.length >= 4) break;
+  }
+  return prompts.length ? prompts : DEFAULT_ASSISTANT_PROMPTS.map((p) => ({ ...p }));
+}
+export function assistantPromptsInThread(env) {
+  const v = String(env?.ASSISTANT_PROMPTS_IN_THREAD ?? "").toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+export function suggestedPromptsArgs(env, channelId, threadTs) {
+  const body = {
+    channel_id: channelId,
+    title: assistantPromptsTitleOf(env),
+    prompts: assistantPromptsOf(env),
+  };
+  if (assistantPromptsInThread(env) && threadTs) body.thread_ts = String(threadTs);
+  return body;
+}
+
+function entityChannelId(value) {
+  if (!value || typeof value !== "object") return null;
+  return value.channel_id ? String(value.channel_id) : null;
+}
+/** Viewed-channel context from either assistant_thread.context or agent entities. Drops unknown fields. */
+export function viewedContextOf(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const entities = [];
+  if (Array.isArray(raw.entities)) {
+    for (const e of raw.entities) {
+      if (!e || typeof e !== "object") continue;
+      const row = {};
+      if (e.type) row.type = String(e.type);
+      if (typeof e.value === "string" || typeof e.value === "number") row.value = String(e.value);
+      if (e.team_id) row.team_id = String(e.team_id);
+      const nested = entityChannelId(e.value);
+      if (nested) row.channel_id = nested;
+      if (e.value && typeof e.value === "object" && e.value.message_ts) row.message_ts = String(e.value.message_ts);
+      if (e.channel_id) row.channel_id = String(e.channel_id);
+      if (row.type || row.value || row.channel_id) entities.push(row);
+      if (entities.length >= 8) break;
+    }
+  }
+  const fromEntity = entities.find((e) => e.channel_id)?.channel_id
+    || entities.find((e) => typeof e.value === "string" && /^[CDG]/.test(e.value))?.value
+    || null;
+  const channel_id = raw.channel_id ? String(raw.channel_id) : fromEntity;
+  const team_id = raw.team_id ? String(raw.team_id) : (entities.find((e) => e.team_id)?.team_id || null);
+  const enterprise_id = raw.enterprise_id ? String(raw.enterprise_id) : null;
+  if (!channel_id && !team_id && !enterprise_id && !entities.length) return null;
+  const out = {};
+  if (channel_id) out.channel_id = channel_id;
+  if (team_id) out.team_id = team_id;
+  if (enterprise_id) out.enterprise_id = enterprise_id;
+  if (entities.length) out.entities = entities;
+  return out;
+}
+export function inlineViewedContext(event) {
+  if (!event || typeof event !== "object") return null;
+  return viewedContextOf(event.app_context) || viewedContextOf(event.context);
+}
+/** Parent thread on a DM. A missing thread_ts, or thread_ts equal to ts, is a top-level DM. */
+export function assistantParentTs(event) {
+  if (!event?.thread_ts || event.thread_ts === event.ts) return null;
+  return String(event.thread_ts);
+}
+export function isAssistantControlEvent(event) {
+  const t = event?.type;
+  return t === "assistant_thread_started"
+    || t === "assistant_thread_context_changed"
+    || t === "app_context_changed"
+    || t === "app_home_opened";
+}
+const assistantThreadKey = (channel, thread) => `assistant:${channel}:${thread}`;
+const assistantUserKey = (user) => `assistant-user:${user}`;
+const assistantGreetedKey = (channel) => `assistant-greeted:${channel}`;
+
+async function putAssistant(env, key, record) {
+  await env.PRIVROOM_STATE.put(key, JSON.stringify(record), { expirationTtl: ASSISTANT_CONTEXT_TTL_SECONDS });
+}
+async function saveAssistantContext(env, { channelId, threadTs, userId, context }) {
+  if (!assistantPanelEnabled(env) || !env?.PRIVROOM_STATE || !context) return;
+  const record = {
+    context,
+    at: Date.now(),
+    channel_id: channelId || null,
+    thread_ts: threadTs || null,
+    user_id: userId || null,
+  };
+  if (channelId && threadTs) await putAssistant(env, assistantThreadKey(channelId, threadTs), record);
+  if (userId) await putAssistant(env, assistantUserKey(userId), record);
+}
+async function readAssistantRecord(env, key) {
+  if (!env?.PRIVROOM_STATE) return null;
+  const raw = await env.PRIVROOM_STATE.get(key);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+/** Context for a DM wake. Ordinary top-level DMs with no inline context stay unchanged. */
+export async function assistantForWake(env, event) {
+  if (!assistantPanelEnabled(env) || !event) return null;
+  const channel = String(event.channel || "");
+  const isDm = event.channel_type === "im" || channel.startsWith("D");
+  if (!isDm) return null;
+  if (event.bot_id || event.subtype === "bot_message") return null;
+  if (event.user && env && cfg(env).ownUserId && event.user === cfg(env).ownUserId) return null;
+  const threadTs = assistantParentTs(event);
+  const inline = inlineViewedContext(event);
+  if (inline) await saveAssistantContext(env, { channelId: channel, threadTs, userId: event.user, context: inline });
+  let stored = null;
+  if (threadTs) stored = await readAssistantRecord(env, assistantThreadKey(channel, threadTs));
+  if (!stored?.context && threadTs && event.user) {
+    const fromUser = await readAssistantRecord(env, assistantUserKey(event.user));
+    if (fromUser?.context) {
+      stored = fromUser;
+      await saveAssistantContext(env, { channelId: channel, threadTs, userId: event.user, context: fromUser.context });
+    }
+  }
+  const context = inline || stored?.context || null;
+  if (!threadTs && !inline) return null;
+  return { thread_ts: threadTs, channel_id: channel, context };
+}
+
+async function postAssistantGreeting(env, channel, threadTs) {
+  const text = assistantGreetingOf(env);
+  if (!text || !channel || isSilentEvent(env, { channel })) return;
+  const body = { channel, text };
+  if (threadTs) body.thread_ts = threadTs;
+  await slackApi(env, "chat.postMessage", body);
+}
+async function setAssistantPrompts(env, channelId, threadTs) {
+  if (!channelId || isSilentEvent(env, { channel: channelId })) return;
+  await slackApi(env, "assistant.threads.setSuggestedPrompts", suggestedPromptsArgs(env, channelId, threadTs));
+}
+
+export async function handleAssistantEvent(env, event, authUserId) {
+  if (!assistantPanelEnabled(env) || !event) return;
+  if (isSilentEvent(env, event)) return;
+  if (event.type === "assistant_thread_started" || event.type === "assistant_thread_context_changed") {
+    const thread = event.assistant_thread || {};
+    const channelId = thread.channel_id ? String(thread.channel_id) : "";
+    const threadTs = thread.thread_ts ? String(thread.thread_ts) : "";
+    if (!channelId || isSilentEvent(env, { channel: channelId })) return;
+    const context = viewedContextOf(thread.context);
+    if (context) await saveAssistantContext(env, { channelId, threadTs, userId: thread.user_id, context });
+    if (event.type === "assistant_thread_context_changed") return;
+    await postAssistantGreeting(env, channelId, threadTs || null);
+    await setAssistantPrompts(env, channelId, threadTs || null);
+    return;
+  }
+  if (event.type === "app_context_changed") {
+    const context = viewedContextOf(event.context);
+    const userId = event.user || authUserId || null;
+    if (context && userId) await saveAssistantContext(env, { userId, context });
+    return;
+  }
+  if (event.type !== "app_home_opened" || event.tab !== "messages") return;
+  const channel = event.channel ? String(event.channel) : "";
+  if (!channel || isSilentEvent(env, { channel })) return;
+  const context = viewedContextOf(event.context);
+  if (context && event.user) await saveAssistantContext(env, { userId: event.user, context });
+  await setAssistantPrompts(env, channel, null);
+  if (!assistantGreetingOf(env) || !env?.PRIVROOM_STATE) return;
+  const mark = assistantGreetedKey(channel);
+  if (await env.PRIVROOM_STATE.get(mark)) return;
+  await putAssistant(env, mark, { at: Date.now() });
+  await postAssistantGreeting(env, channel, null);
+}
+
 async function handle(env, c, e, action) {
   if (isSilentEvent(env, e)) return;
   if (action === "welcome") return welcome(env, c, e);
@@ -827,6 +1045,7 @@ export default {
         service: "slack-bridge-example",
         configured: !!(env.SLACK_SIGNING_SECRET && env.GROK_WEBHOOK_URL && env.SLACK_BOT_TOKEN),
         privroom_synthesize: privroomSynthEnabled(env),
+        assistant_panel: assistantPanelEnabled(env),
       });
     }
     if (request.method === "POST" && url.pathname === "/internal/privroom-selftest") {
@@ -865,6 +1084,17 @@ export default {
       const recordTask = scheduleSilentRecord(env, e);
       if (recordTask) ctx.waitUntil(recordTask);
       return json({ ok: true, action: "ignore", reason: "silent" }, 200, { "X-Relay-Action": "ignore:silent" });
+    }
+
+    // Panel control events are not wakes. Mute already returned when event.channel
+    // is listed. The handler also refuses a muted assistant DM.
+    if (isAssistantControlEvent(body.event)) {
+      const authUser = Array.isArray(body.authorizations)
+        ? (body.authorizations.find((a) => a && a.user_id)?.user_id || null)
+        : null;
+      log("assistant", body.event_id, body.event.type, body.event.assistant_thread?.channel_id || body.event.channel || "");
+      ctx.waitUntil(handleAssistantEvent(env, body.event, authUser).catch((err) => log("assistant error", err?.message || err)));
+      return json({ ok: true, action: "assistant", reason: body.event.type }, 200, { "X-Relay-Action": `assistant:${body.event.type}` });
     }
 
     // Explicit 1:1 search only. A deny or a normal DM does not fetch record sessions.

@@ -78,6 +78,17 @@ HONCHO_READ_TOKENS = "3000"
 HONCHO_ARCHIVE_SESSION = "archive-private"
 HONCHO_PLAYBOOKS_SESSION = "privroom-playbooks"
 HONCHO_ARCHIVE_CHANNEL_IDS = "CPLACEHOLDER1"
+# Assistant / agent panel. "0" disables greeting, prompts, and context.
+# Defaults are generic. Real copy belongs in untracked runtime config.
+# ASSISTANT_PROMPTS is a JSON list of {title, message}, at most 4.
+# Leave ASSISTANT_PROMPTS_IN_THREAD off for Agents & AI Apps. "1" is only for a
+# legacy assistant container; an agent app ignores prompts when thread_ts is set.
+# Context is stored on the PRIVROOM_STATE binding for 30 days.
+ASSISTANT_PANEL = "1"
+ASSISTANT_GREETING = ""              # empty uses the generic default; "off" skips the post
+ASSISTANT_PROMPTS_TITLE = ""
+# ASSISTANT_PROMPTS = '[{"title":"Ask a question","message":"What can you help me with?"}]'
+ASSISTANT_PROMPTS_IN_THREAD = "0"
 # Sticky threads need a KV binding named PRIVROOM_STATE. "0" disables.
 # A sole @mention, or a root message from this bot, owns the thread for 7 days.
 # A reply inside an existing thread does not. Untagged human replies wake.

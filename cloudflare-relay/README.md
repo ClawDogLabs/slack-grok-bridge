@@ -175,6 +175,21 @@ A post that only replies inside an existing thread (`thread_ts` different from `
 
 `STICKY_THREADS=0`, `false`, or `off` disables it. The KV binding has to be named `PRIVROOM_STATE`. `OWN_USER_ID` (or a successful `auth.test`) has to identify this bot. `message.channels` must be subscribed or Slack will not deliver the bot's own root post; private channels need `message.groups` as well. No separate callback from the reply routine is required. A new conversation the routine starts has to be a top-level `chat.postMessage` with no `thread_ts`. A send that sets `thread_ts` is a reply and does not claim. Muted channels return before this runs, so they neither claim nor wake. `SILENT_RECORD`, `ACK_REACTION`, and `HOLD_ACK` are independent: leave them as set in untracked runtime config. `HOLD_ACK` stays off unless that var is true. The ack reaction stays whatever `ACK_REACTION` names.
 
+## Assistant panel
+
+Slack's agent and assistant container is a DM. This Worker does not wake on `assistant_thread_started`, `assistant_thread_context_changed`, `app_context_changed`, or `app_home_opened`.
+
+- `assistant_thread_started` posts `ASSISTANT_GREETING` into that thread and calls `assistant.threads.setSuggestedPrompts`. The greeting default is `Hi. Ask a question, or choose a prompt.` Prompts default to two generic ones. `ASSISTANT_PROMPTS` is a JSON list of `{title, message}` (at most four). `ASSISTANT_GREETING=off` skips the post. `ASSISTANT_PANEL=0` skips all of this.
+- Prompts omit `thread_ts`. Agents & AI Apps silently ignore the call when `thread_ts` is set. Set `ASSISTANT_PROMPTS_IN_THREAD=1` only for a legacy assistant container.
+- `app_home_opened` with `tab` `messages` refreshes those prompts and posts the greeting once per DM, which is how an agent app learns the Messages tab was opened. The Home tab is ignored. The once-only mark needs `PRIVROOM_STATE`.
+- `assistant_thread_context_changed` stores the viewed channel on `PRIVROOM_STATE` at `assistant:<dm channel>:<thread ts>` for 30 days. It does not post and does not read that channel. `app_context_changed` stores the same kind of context for the authorized user. A later reply in an assistant thread copies it onto that thread.
+- A `message.im` that has a parent `thread_ts` (different from its own `ts`) wakes with `reply.thread_ts` set to that parent, `reply.reply_broadcast` false, and `assistant.context` when a viewed channel is known. The routine must `chat.postMessage` with that `thread_ts` so the answer stays in the panel thread.
+- A DM with no `thread_ts` stays a top-level reply, as before. If that message itself carries `app_context` or `context`, the wake includes `assistant.context` and `reply.thread_ts` is still null.
+- While that wake runs, the Worker calls `assistant.threads.setStatus` with `is thinking…` on the DM thread, then clears it with an empty status after the webhook returns. The ack reaction and `HOLD_ACK` are unchanged. `HOLD_ACK` stays off unless set true.
+- The bot's own messages, including the greeting, do not wake.
+
+Subscribe to bot events `assistant_thread_started`, `assistant_thread_context_changed`, `app_home_opened`, `app_context_changed`, and `message.im`. `assistant:write` is the scope for prompts and status. `app_context_changed` also requires that scope and `agent_view`. The relay does not subscribe for you. It does not handle `agent_session_stopped`; without that subscription Slack shows a loading indicator with no stop button. A viewed channel that is muted is not fetched. Its id can still appear on `assistant.context`.
+
 ## Private record (off by default)
 
 `SILENT_RECORD` defaults to `"0"`. Leave it off until the mute is what the live Worker is running, `message.groups` is subscribed, the bot token has `groups:history`, and you have watched one new message log `honcho record ok` without a Slack reaction. Mentions already arrive as `app_mention`. Ordinary private-channel messages do not arrive until those two Slack settings are verified. This repo does not change the Slack app.

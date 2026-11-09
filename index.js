@@ -478,13 +478,20 @@ async function processInbound({ kind, event, client, logger, sayOnFail }) {
   const fields = replyFields(enriched);
   try {
     const slack = await summarizeEvent(client, enriched);
-    await wakeGrok({
+    const payload = {
       source: BRIDGE_SOURCE,
       kind,
       slack,
       hold_ack: looksPersonal(slack.text) ? "personal" : "generic",
       reply: fields,
-    });
+    };
+    try {
+      const assistant = await assistantForWake(process.env, enriched);
+      if (assistant) payload.assistant = assistant;
+    } catch (err) {
+      logger?.warn?.("assistant context", err?.message || err);
+    }
+    await wakeGrok(payload);
     logger.info(`[${ts()}] wake ok`, kind, channel, event.ts);
     await clearThinking(client, channel, threadTs, logger);
     await postHoldAck(client, channel, slack.text, fields, logger);
@@ -600,6 +607,38 @@ app.message(async ({ message, client, logger }) => {
     sayOnFail: null,
   });
 });
+
+// In-process store so Socket Mode can keep assistant-thread context without KV.
+// The Worker uses PRIVROOM_STATE instead. Shape matches that binding's get/put.
+const assistantMemory = new Map();
+const assistantKv = {
+  async get(key) { return assistantMemory.has(key) ? assistantMemory.get(key) : null; },
+  async put(key, value) { assistantMemory.set(key, value); },
+};
+let assistantApi = null;
+function assistantEnv() {
+  return { ...process.env, PRIVROOM_STATE: assistantKv };
+}
+async function loadAssistantApi() {
+  if (!assistantApi) assistantApi = await import("./cloudflare-relay/src/index.js");
+  return assistantApi;
+}
+async function assistantForWake(env, event) {
+  const api = await loadAssistantApi();
+  return api.assistantForWake({ ...env, PRIVROOM_STATE: assistantKv }, event);
+}
+async function onAssistantControl(event, logger) {
+  try {
+    const api = await loadAssistantApi();
+    await api.handleAssistantEvent(assistantEnv(), event, null);
+  } catch (err) {
+    logger?.warn?.("assistant event failed", event?.type, err?.message || err);
+  }
+}
+app.event("assistant_thread_started", async ({ event, logger }) => onAssistantControl(event, logger));
+app.event("assistant_thread_context_changed", async ({ event, logger }) => onAssistantControl(event, logger));
+app.event("app_context_changed", async ({ event, logger }) => onAssistantControl(event, logger));
+app.event("app_home_opened", async ({ event, logger }) => onAssistantControl(event, logger));
 
 // Fail fast on startup/unexpected errors so the supervisor restarts cleanly.
 process.on("unhandledRejection", (err) => {
