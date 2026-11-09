@@ -147,6 +147,86 @@ In [api.slack.com/apps](https://api.slack.com/apps) → your app:
 5. Test: DM the bot, and @mention it in a channel it's in, while watching
    `npx wrangler tail slack-bridge-example`.
 
+## Mute a channel (no recording)
+
+`SILENT_CHANNEL_IDS` is a comma-separated list of Slack channel ids. For every event in those channels the Worker returns HTTP 200 and stops. It does not call `reactions.add` (so a custom ack such as `sample-ack` is not added), `assistant.threads.setStatus`, `chat.postMessage`, `conversations.replies`, or the Grok webhook, and it does not write Honcho. The check is in front of `auth.test`, routing, welcome, watched-channel wakes, and ingest. It covers `app_mention` (including messages with an `edited` field), `message`, `message_changed` (channel on the outer event or on `message.channel`), thread replies, `channel_join` / `group_join`, `member_joined_channel`, and Slack retries.
+
+Listing a channel does **not** turn on recording. Leave `HONCHO_INGEST` as it is. Do **not** add the muted id to `HONCHO_CHANNEL_IDS` (that list is the public-ingest allowlist and would store messages on the shared Slack user peer). Backfill skips muted ids the same way.
+
+`message.groups` and `groups:history` are **not** required for this mute. Mentions in a private channel already arrive as `app_mention`, which is the path that was adding the ack and the thinking status. Those subscription and scope checks matter only before a later recording enablement. Recording stays off until that privacy path is reviewed and explicitly switched on. This change does not add that switch.
+
+Deploy the mute (do this only when you intend to ship; this repo does not deploy it):
+
+1. Deploy **this** revision of the Worker before relying on the variable. An older Worker ignores `SILENT_CHANNEL_IDS` and will keep acking.
+2. Set `SILENT_CHANNEL_IDS = "C0SYNTH0001"` in `[vars]` and deploy again. One deploy of this revision with the variable already set is enough.
+3. Do not post test messages into the channel. Watch `npx wrangler tail slack-bridge-example` for a `silent` log line and confirm there is no `wake ok` for that channel.
+4. Rollback the mute by clearing `SILENT_CHANNEL_IDS` and deploying. That restores acks and wakes for the channel.
+
+`node-http-relay` imports this module, so the same variable mutes there too. Socket Mode checks the variable at the start of `app_mention` and `message`, before thinking status. The live host is the Worker.
+
+## Thread ownership
+
+A thread this bot owns wakes on a later human reply that does not @mention anyone. Two starts create that ownership, both stored in `PRIVROOM_STATE` for 7 days (`sticky:<channel>:<root ts>`):
+
+- A person @mentions only this bot. Mentioning this bot and someone else does not take the thread.
+- This bot posts the root message. Slack delivers that post back as a `message` event (`bot_message`, this bot's user id or bot id, no parent `thread_ts`). The Worker marks the thread and does not wake. The same mark is written when this Worker itself posts a root `chat.postMessage` (no `thread_ts`).
+
+A post that only replies inside an existing thread (`thread_ts` different from `ts`) does not take that thread. If a mark is already stored, a later root event does not replace it. An @mention of someone else wakes with `sticky_other_tag: true` and leaves the mark in place, so the next untagged human reply still wakes. Messages from any bot, including this one, never wake.
+
+`STICKY_THREADS=0`, `false`, or `off` disables it. The KV binding has to be named `PRIVROOM_STATE`. `OWN_USER_ID` (or a successful `auth.test`) has to identify this bot. `message.channels` must be subscribed or Slack will not deliver the bot's own root post; private channels need `message.groups` as well. No separate callback from the reply routine is required. A new conversation the routine starts has to be a top-level `chat.postMessage` with no `thread_ts`. A send that sets `thread_ts` is a reply and does not claim. Muted channels return before this runs, so they neither claim nor wake. `SILENT_RECORD`, `ACK_REACTION`, and `HOLD_ACK` are independent: leave them as set in untracked runtime config. `HOLD_ACK` stays off unless that var is true. The ack reaction stays whatever `ACK_REACTION` names.
+
+## Assistant panel
+
+Slack's agent and assistant container is a DM. This Worker does not wake on `assistant_thread_started`, `assistant_thread_context_changed`, `app_context_changed`, or `app_home_opened`.
+
+- `assistant_thread_started` posts `ASSISTANT_GREETING` into that thread and calls `assistant.threads.setSuggestedPrompts`. The greeting default is `Hi. Ask a question, or choose a prompt.` Prompts default to two generic ones. `ASSISTANT_PROMPTS` is a JSON list of `{title, message}` (at most four). `ASSISTANT_GREETING=off` skips the post. `ASSISTANT_PANEL=0` skips all of this.
+- Prompts omit `thread_ts`. Agents & AI Apps silently ignore the call when `thread_ts` is set. Set `ASSISTANT_PROMPTS_IN_THREAD=1` only for a legacy assistant container.
+- `app_home_opened` with `tab` `messages` refreshes those prompts and posts the greeting once per DM, which is how an agent app learns the Messages tab was opened. The Home tab is ignored. The once-only mark needs `PRIVROOM_STATE`.
+- `assistant_thread_context_changed` stores the viewed channel on `PRIVROOM_STATE` at `assistant:<dm channel>:<thread ts>` for 30 days. It does not post and does not read that channel. `app_context_changed` stores the same kind of context for the authorized user. A later reply in an assistant thread copies it onto that thread.
+- A `message.im` that has a parent `thread_ts` (different from its own `ts`) wakes with `reply.thread_ts` set to that parent, `reply.reply_broadcast` false, and `assistant.context` when a viewed channel is known. The routine must `chat.postMessage` with that `thread_ts` so the answer stays in the panel thread.
+- A DM with no `thread_ts` stays a top-level reply, as before. If that message itself carries `app_context` or `context`, the wake includes `assistant.context` and `reply.thread_ts` is still null.
+- While that wake runs, the Worker calls `assistant.threads.setStatus` with `is thinking…` on the DM thread, then clears it with an empty status after the webhook returns. The ack reaction and `HOLD_ACK` are unchanged. `HOLD_ACK` stays off unless set true.
+- The bot's own messages, including the greeting, do not wake.
+
+Subscribe to bot events `assistant_thread_started`, `assistant_thread_context_changed`, `app_home_opened`, `app_context_changed`, and `message.im`. `assistant:write` is the scope for prompts and status. `app_context_changed` also requires that scope and `agent_view`. The relay does not subscribe for you. It does not handle `agent_session_stopped`; without that subscription Slack shows a loading indicator with no stop button. A viewed channel that is muted is not fetched. Its id can still appear on `assistant.context`.
+
+## Private record (off by default)
+
+`SILENT_RECORD` defaults to `"0"`. Leave it off until the mute is what the live Worker is running, `message.groups` is subscribed, the bot token has `groups:history`, and you have watched one new message log `honcho record ok` without a Slack reaction. Mentions already arrive as `app_mention`. Ordinary private-channel messages do not arrive until those two Slack settings are verified. This repo does not change the Slack app.
+
+When the switch is on, a muted channel is written to the **same** Honcho workspace (no second workspace) as session `record-<channelId>` and peer `rec-<channelId>-<slackUserId>`. The Slack user id is metadata for the owner view, not the Honcho peer id. The public session `channel-<id>` is not used. Setup sends session configuration `reasoning.enabled`, `summary.enabled`, `dream.enabled` false and `peer_card.create` / `use` false, session-peer `observe_me` and `observe_others` false, and message `reasoning.enabled` false. Honcho v3.6 documents message config as the highest layer and `observe_me` defaulting to true; the deriver skips a representation only when the effective flag is false, and summaries are a separate queue, which is why summary is disabled explicitly. The session PUT and the peer-config PUT must succeed or the message is not posted, and the code does not fall back to public ingest. Wake reads (`HONCHO_READ`) return `silent` and do not fetch `record-<id>`.
+
+That does not prove the hosted service has no other workspace-wide reader. Do not enable the switch until that limit is accepted.
+
+### Explicit lookup only
+
+Nothing in a wake payload, including an owner DM that does not ask, includes this session. A search has to name the channel (its id or `SILENT_CHANNEL_ALIASES`) and use history language (`search`, `history`, `what was said`, …). The Worker checks Slack's `user` and `channel_type: im` on a `D…` channel. Text that claims a name is ignored. Readers are `SILENT_CHANNEL_READERS` (`CHANNEL:USER|USER`). Example only — these ids are synthetic. Real ids stay in untracked runtime config:
+
+```toml
+SILENT_CHANNEL_IDS = "C0SYNTH0001"
+SILENT_RECORD = "0"   # set "1" only after the checks above
+SILENT_CHANNEL_ALIASES = "C0SYNTH0001:record-room|record room"
+SILENT_CHANNEL_READERS = "C0SYNTH0001:U0SYNTH0001|U0SYNTH0002|U0SYNTH0003|U0SYNTH0004"
+SILENT_GROK_READER_IDS = "U0SYNTH0001"
+```
+
+An allowed 1:1 DM gets one `chat.postMessage` back in that DM (no broadcast, no reaction, no wake). Other surfaces get nothing from this store. The configured owner's private Grok chat can call `queryRecordSession(env, { source: "owner-grok", requesterId, channelId })`, which returns session messages and null peer fields. Do not expose that function on HTTP. Render it only in that chat.
+
+### Catch-up since channel creation
+
+Honcho stays empty for this channel until `SILENT_RECORD` is on. Messages already in `log/raw/*.jsonl` are not a Honcho backlog. After one live `honcho record ok`, and only then, replay **this channel** from its creation timestamp. `--since` is required. Other channels in the same files are skipped. A plain `--write` refuses muted ids and must not be used for this.
+
+```bash
+node --env-file=.env scripts/honcho-backfill.mjs --record-only \
+  --channel C0SYNTH0001 --since <creation slack ts> --dir log/raw
+node --env-file=.env scripts/honcho-backfill.mjs --record-only --write \
+  --channel C0SYNTH0001 --since <creation slack ts> --dir log/raw
+```
+
+Dry-run prints `peer_id` values that start with `rec-` and `session_id` `record-C0SYNTH0001`. If a line shows a raw `U…` peer id, do not pass `--write`. This is not a full-history import.
+
+Deploy this the same way as the mute: cherry-pick onto the source that matches the running Worker (`2b1c4525` is not in this repo). Do not `wrangler deploy` this git tree over that script.
+
 ## Honcho ingest (off by default)
 
 `HONCHO_INGEST` in `[vars]` defaults to `"0"`. Public-channel writes run inside `ctx.waitUntil` after the Worker has already built the `200` response. `wakeGrok` does not call Honcho. Ingest itself does not read.
@@ -163,7 +243,7 @@ In [api.slack.com/apps](https://api.slack.com/apps) → your app:
 2. In Slack, **Event Subscriptions → Subscribe to bot events**, add `message.channels` if it is not already there. Save. Reinstall only if Slack asks. Do not add `message.groups` for this phase (private channels are filtered out). The bot must already be in the channel. `channels:history` is the matching scope (already on the sample manifest).
 3. Dry-run history from the repo root. Pass the public channel ids, because log rows have no `channel_type` and `conversations.info` fails closed without `channels:read`:
    `node --env-file=.env scripts/honcho-backfill.mjs --dry-run --channel-ids C0123,C0456`
-   `--write` posts. The script does not use the Worker. `samplebot` in the log is written as `OWN_USER_ID` (or `auth.test` `user_id`), not the string `samplebot`.
+   `--write` posts. The script does not use the Worker. A `BOT_NAME` label in the log is written as `OWN_USER_ID` (or `auth.test` `user_id`), not as that label.
 4. `npx wrangler secret put HONCHO_API_KEY`, confirm `HONCHO_WORKSPACE_ID` (`slack-workspace` if unset), then set `HONCHO_INGEST = "1"` and deploy again.
 5. Watch `npx wrangler tail` for `honcho ok` / `honcho skip`. A DM must not produce a Honcho post.
 6. Rollback: set `HONCHO_INGEST` back to `"0"` (or delete the var) and deploy. Ingest becomes a no-op. Already stored Honcho messages are left as-is.

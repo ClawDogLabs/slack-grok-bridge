@@ -18,16 +18,38 @@
  * and forwardWatched await one session context and attach payload.honcho before
  * wakeGrok. A slow or failed read still wakes (honcho.ok === false). See src/honcho.js.
  *
+ * SILENT_CHANNEL_IDS (comma-separated) is a mute. Those channels get HTTP 200
+ * and nothing else: no reaction, thinking status, hold-ack, welcome, wake, or
+ * Honcho write. The check runs before ensureSelf and before route/handle.
+ * Listing a channel does not enable recording.
+ *
  * Acknowledgement is a reaction (ACK_REACTION, default white_check_mark). The text
  * hold-ack is opt-in (HOLD_ACK=true). Replies the Worker itself posts follow the
  * threading rule: plain in DMs/group DMs unless already threaded; thread +
  * reply_broadcast in channels. The same placement is sent as `reply` on the webhook.
  *
+ * Assistant / agent panel: assistant_thread_started posts ASSISTANT_GREETING and
+ * sets suggested prompts. assistant_thread_context_changed (and app_context_changed)
+ * stores the viewed channel on PRIVROOM_STATE. A DM that already has a parent
+ * thread_ts wakes with that thread_ts and payload.assistant. A DM with no
+ * thread_ts stays top-level. ASSISTANT_PANEL=0 disables the panel extras.
+ *
  * Every request is answered fast (200 within ms); slow work runs in ctx.waitUntil so Slack's
  * 3-second deadline is never at risk.
  */
 
-import { fetchWakeContext, honchoReadEnabled, ingestIfEnabled } from "./honcho.js";
+import {
+  classifyRecordSearch,
+  eventChannelId,
+  fetchWakeContext,
+  formatRecordReply,
+  honchoReadEnabled,
+  ingestIfEnabled,
+  ingestSilentIfEnabled,
+  isSilentEvent,
+  queryRecordSession,
+  silentChannelSet,
+} from "./honcho.js";
 
 const enc = new TextEncoder();
 const FORWARD_SUBTYPES = new Set(["file_share", "slack_audio"]);
@@ -116,6 +138,7 @@ export function cfg(env) {
     mpimRequireAddress: isTrue(env.MPIM_REQUIRE_ADDRESS, false),
     watch: idSet(env.WATCH_CHANNEL_IDS),
     welcome: idSet(env.WELCOME_CHANNEL_IDS),
+    silent: silentChannelSet(env),
     welcomeText: env.WELCOME_TEXT || ":wave: Welcome, {user}! Ask me anything {ask_channel}, or @mention me in any channel I'm in.",
     askChannel: env.ASK_CHANNEL_ID || null,
     allowBotIds: idSet(env.ALLOW_BOT_IDS),
@@ -175,6 +198,8 @@ function worthForwarding(text, c) {
 /** Returns { action, reason }. action: wake_mention | wake_dm | watched | welcome | ignore */
 export function route(e, c) {
   if (!e || typeof e !== "object") return { action: "ignore", reason: "no-event" };
+  // Before mention, DM, watch, welcome, and join handling. Edits and joins included.
+  if (c.silent?.has(eventChannelId(e))) return { action: "ignore", reason: "silent" };
   const mentionsMe = !!c.ownUserId && String(e.text || "").includes(`<@${c.ownUserId}>`);
 
   if (e.type === "app_mention") {
@@ -222,7 +247,17 @@ export function dropRetry(reason, c) {
 }
 
 // ---------------------------------------------------------------- Slack Web API
+/** True when a Slack Web API body targets a muted channel. Blocks reads and writes. */
+export function silentSlackWriteBlocked(env, body) {
+  const channel = body && typeof body === "object" ? (body.channel || body.channel_id) : "";
+  return isSilentEvent(env, { channel });
+}
+
 async function slackApi(env, method, body, { get = false, quiet = false } = {}) {
+  if (silentSlackWriteBlocked(env, body)) {
+    log("silent channel blocked", method, body?.channel || body?.channel_id);
+    return { ok: false, error: "silent_channel" };
+  }
   const url = `https://slack.com/api/${method}`;
   const headers = { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` };
   let res;
@@ -234,6 +269,9 @@ async function slackApi(env, method, body, { get = false, quiet = false } = {}) 
   }
   const data = await res.json().catch(() => ({ ok: false, error: `http_${res.status}` }));
   if (!data.ok && !quiet) log(`slack ${method} failed:`, data.error);
+  if (!get && method === "chat.postMessage") {
+    await noteOwnRootPost(env, body, data).catch((err) => log("sticky claim error", err?.message || err));
+  }
   return data;
 }
 
@@ -267,6 +305,7 @@ async function resolveChannelType(env, e) {
 
 /** React to the message that just arrived. Custom emoji missing → white_check_mark. Missing scope is logged once per call. */
 async function addAckReaction(env, c, channel, ts) {
+  if (isSilentEvent(env, { channel })) return;
   if (!c.ackReaction || !channel || !ts) return;
   const name = c.ackReaction;
   const res = await slackApi(env, "reactions.add", { channel, timestamp: ts, name }, { quiet: true }).catch((err) => ({ ok: false, error: err?.message || "request_failed" }));
@@ -329,6 +368,11 @@ async function summarizeEvent(env, e) {
 }
 
 async function wakeGrok(env, payload) {
+  const channel = payload?.slack?.channel || payload?.channel;
+  if (isSilentEvent(env, { channel })) {
+    log("silent channel blocked wake", channel);
+    return "";
+  }
   const headers = { "Content-Type": "application/json" };
   if (env.GROK_WEBHOOK_SECRET) {
     headers["Authorization"] = `Bearer ${env.GROK_WEBHOOK_SECRET}`;
@@ -345,14 +389,19 @@ async function wakeGrok(env, payload) {
   return text;
 }
 
-const setThinking = (env, c, channel, threadTs) =>
-  slackApi(env, "assistant.threads.setStatus", {
+const setThinking = (env, c, channel, threadTs) => {
+  if (isSilentEvent(env, { channel })) return Promise.resolve();
+  return slackApi(env, "assistant.threads.setStatus", {
     channel_id: channel, thread_ts: threadTs, status: "is thinking…", loading_messages: c.loading,
   }).catch(() => {});
-const clearThinking = (env, channel, threadTs) =>
-  slackApi(env, "assistant.threads.setStatus", { channel_id: channel, thread_ts: threadTs, status: "" }).catch(() => {});
+};
+const clearThinking = (env, channel, threadTs) => {
+  if (isSilentEvent(env, { channel })) return Promise.resolve();
+  return slackApi(env, "assistant.threads.setStatus", { channel_id: channel, thread_ts: threadTs, status: "" }).catch(() => {});
+};
 
 async function postHoldAck(env, c, channel, fields, text) {
+  if (isSilentEvent(env, { channel })) return;
   if (!c.holdAck || !channel) return;
   if (c.holdAckSkip && c.holdAckSkip.test(String(text || ""))) return log("hold-ack skipped (HOLD_ACK_SKIP_REGEX)");
   const body = c.personalRe.test(String(text || "")) ? c.holdAckPersonal : c.holdAckGeneric;
@@ -374,7 +423,8 @@ async function honchoForWake(env, e) {
   return honcho;
 }
 
-async function processInbound(env, c, kind, e, sayOnFail) {
+async function processInbound(env, c, kind, e, sayOnFail, extra = null) {
+  if (isSilentEvent(env, e)) return;
   const channel = e.channel;
   const threadTs = e.thread_ts || e.ts;
   const placement = replyFields(e);
@@ -390,6 +440,12 @@ async function processInbound(env, c, kind, e, sayOnFail) {
       reply: placement,
     };
     if (honchoReadEnabled(env)) payload.honcho = await honchoForWake(env, e);
+    const assistant = await assistantForWake(env, e).catch((err) => {
+      log("assistant context", err?.message || err);
+      return null;
+    });
+    if (assistant) payload.assistant = assistant;
+    if (extra && typeof extra === "object") Object.assign(payload, extra);
     await wakeGrok(env, payload);
     log("wake ok", kind, channel, e.ts);
     await clearThinking(env, channel, threadTs);
@@ -408,6 +464,7 @@ async function processInbound(env, c, kind, e, sayOnFail) {
 }
 
 async function forwardWatched(env, c, e) {
+  if (isSilentEvent(env, e)) return;
   try {
     const slack = await summarizeEvent(env, e);
     const payload = { source: c.source, kind: "channel_message", watched: true, slack, reply: replyFields(e) };
@@ -432,6 +489,7 @@ async function botCapReached(env, c, e) {
 }
 
 async function welcome(env, c, e) {
+  if (isSilentEvent(env, e)) return;
   const info = await resolveUser(env, e.user);
   if (info?.is_bot) return;
   if (e.ts) await slackApi(env, "reactions.add", { channel: e.channel, timestamp: e.ts, name: "wave" }).catch(() => {});
@@ -462,7 +520,32 @@ async function lookupIngestChannel(env, channel) {
 // outside WATCH_CHANNEL_IDS) and for our own bot replies in public channels.
 // Returns null when HONCHO_INGEST is off. Caller must only waitUntil the promise.
 // Missing channel_type: HONCHO_CHANNEL_IDS, else conversations.info, else skip.
+function scheduleSilentRecord(env, e) {
+  return ingestSilentIfEnabled(env, e, {
+    log: (...a) => log(...a),
+    resolveDisplay: async (userId) => {
+      const u = await resolveUser(env, userId);
+      return u?.display_name || u?.real_name || u?.name || null;
+    },
+  });
+}
+
+async function deliverRecordSearch(env, event, decision) {
+  if (!decision || decision.kind !== "allow") return;
+  const dm = String(event?.channel || "");
+  if (event?.channel_type !== "im" || !dm.startsWith("D")) return;
+  if (isSilentEvent(env, event) || dm === decision.channelId) return;
+  const result = await queryRecordSession(env, { source: "slack-im", event });
+  const text = formatRecordReply(result, { label: decision.channelId });
+  const post = { channel: dm, text };
+  const parent = assistantParentTs(event);
+  if (parent) post.thread_ts = parent;
+  await slackApi(env, "chat.postMessage", post);
+  log("record search posted", decision.channelId, decision.requesterId, result.ok ? (result.messages || []).length : (result.error || "fail"));
+}
+
 function scheduleHoncho(env, c, e) {
+  if (isSilentEvent(env, e)) return null;
   return ingestIfEnabled(env, e, {
     ownUserId: c.ownUserId,
     ownBotId: c.ownBotId,
@@ -476,7 +559,468 @@ function scheduleHoncho(env, c, e) {
   });
 }
 
+// Sticky thread ownership. A human mention of only this bot marks the thread.
+// A root message from this bot does too (it started the thread). A reply posted
+// into an existing thread does not. Later untagged human replies wake with
+// sticky:true. Other tags wake with sticky_other_tag and do not clear the mark.
+// Bot messages never wake. An existing mark is not replaced by a later claim.
+// STICKY_THREADS=0/false/off disables. TTL is 7 days.
+const STICKY_TTL_SECONDS = 7 * 24 * 3600;
+const STICKY_OWN_SUBTYPES = new Set(["bot_message", "file_share", "slack_audio"]);
+export function stickyEnabled(env) {
+  const v = String(env?.STICKY_THREADS ?? "1").toLowerCase();
+  return v !== "0" && v !== "false" && v !== "off";
+}
+export function taggedUserIds(text) {
+  return [...String(text || "").matchAll(/<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g)].map((m) => m[1]);
+}
+const stickyKey = (channel, root) => `sticky:${channel}:${root}`;
+function isOwnEvent(e, c) {
+  if (!e || !c) return false;
+  if (c.ownBotId && e.bot_id && e.bot_id === c.ownBotId) return true;
+  if (c.ownUserId && e.user && e.user === c.ownUserId) return true;
+  return false;
+}
+export function stickyOp(e, c) {
+  if (!e || !c?.ownUserId || !e.channel) return { op: null };
+  const isApp = e.type === "app_mention";
+  if (!isApp && e.type !== "message") return { op: null };
+  if (!isApp && e.channel_type !== "channel" && e.channel_type !== "group") return { op: null };
+  if (String(e.channel).startsWith("D")) return { op: null };
+  if (isOwnEvent(e, c)) {
+    if (isApp) return { op: null };
+    if (e.subtype && !STICKY_OWN_SUBTYPES.has(e.subtype)) return { op: null };
+    if (!e.ts || (e.thread_ts && e.thread_ts !== e.ts)) return { op: null };
+    return { op: "claim", root: e.ts };
+  }
+  if (e.bot_id || !e.user) return { op: null };
+  if (e.subtype && !FORWARD_SUBTYPES.has(e.subtype) && e.subtype !== "slack_audio") return { op: null };
+  const root = e.thread_ts || e.ts;
+  const tags = [...new Set(taggedUserIds(e.text))];
+  const hasMe = tags.includes(c.ownUserId);
+  const other = tags.some((u) => u !== c.ownUserId);
+  if (hasMe) return { op: other ? null : "set", root };
+  if (isApp) return { op: null };
+  if (e.thread_ts && e.thread_ts !== e.ts) return { op: "check", root, otherTag: other };
+  return { op: null };
+}
+async function putSticky(env, key, record) {
+  await env.PRIVROOM_STATE.put(key, JSON.stringify(record), { expirationTtl: STICKY_TTL_SECONDS });
+}
+async function applySticky(env, c, e) {
+  if (!stickyEnabled(env) || !env.PRIVROOM_STATE) return;
+  if (isSilentEvent(env, e)) return;
+  const { op, root, otherTag } = stickyOp(e, c);
+  if (!op) return;
+  const key = stickyKey(e.channel, root);
+  if (op === "claim") {
+    if (await env.PRIVROOM_STATE.get(key)) return;
+    await putSticky(env, key, { by: c.ownUserId, at: Date.now(), via: "bot" });
+    return log("sticky claim", e.channel, root);
+  }
+  if (op === "set") {
+    await putSticky(env, key, { by: e.user, at: Date.now(), via: "mention" });
+    return log("sticky set", e.channel, root);
+  }
+  if (!(await env.PRIVROOM_STATE.get(key))) return;
+  log("sticky wake", e.channel, root, e.ts);
+  await processInbound(env, c, "app_mention", e, true, otherTag ? { sticky: true, sticky_other_tag: true } : { sticky: true });
+}
+
+/** Claim a thread this Worker just opened. Threaded posts, DMs, and muted channels do not claim. An existing mark is left as it is. */
+export async function noteOwnRootPost(env, body, result) {
+  if (!stickyEnabled(env) || !env?.PRIVROOM_STATE) return;
+  if (!result?.ok || !result.ts || !body || typeof body !== "object") return;
+  if (body.thread_ts) return;
+  const channel = String(body.channel || "");
+  if (!channel || channel.startsWith("D")) return;
+  if (isSilentEvent(env, { channel })) return;
+  const key = stickyKey(channel, result.ts);
+  if (await env.PRIVROOM_STATE.get(key)) return;
+  // Identity comes from OWN_USER_ID or an earlier auth.test. Do not call
+  // ensureSelf here: muted events must stay ahead of auth.test, and the
+  // Slack echo of this post claims once the event path has resolved it.
+  const c = cfg(env);
+  if (!c.ownUserId) return;
+  await putSticky(env, key, { by: c.ownUserId, at: Date.now(), via: "send" });
+  log("sticky claim", channel, result.ts);
+}
+
+// Private-room synthesize roster. Empty unless PRIVROOM_BOTS is set.
+// JSON: [{"name":"BotA","userId":"U...","botId":"B..."}]. Bad JSON matches nobody.
+export function privroomBotsOf(env) {
+  const raw = env?.PRIVROOM_BOTS;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return [];
+  let arr;
+  try { arr = JSON.parse(String(raw)); } catch { return []; }
+  if (!Array.isArray(arr)) return [];
+  return arr.filter((b) => b && b.name && (b.userId || b.botId)).map((b) => ({
+    name: String(b.name),
+    userId: b.userId ? String(b.userId) : "",
+    botId: b.botId ? String(b.botId) : "",
+  }));
+}
+function privroomDelaySeconds(env) {
+  const n = Number.parseInt(env?.PRIVROOM_DELAY_SECONDS ?? "300", 10);
+  return Number.isFinite(n) && n > 0 ? n : 300;
+}
+function privroomTags(env) {
+  const custom = String(env?.PRIVROOM_MENTION_TAGS || "").trim();
+  if (custom) return custom;
+  return privroomBotsOf(env).map((b) => b.userId).filter(Boolean).map((id) => `<@${id}>`).join(" ");
+}
+export function privroomSynthEnabled(env) {
+  const v = String(env?.PRIVROOM_SYNTHESIZE ?? "1").toLowerCase();
+  return v !== "0" && v !== "false" && v !== "off";
+}
+export function matchPrivroomBot(e, env) {
+  if (!e) return null;
+  for (const b of privroomBotsOf(env)) {
+    if (e.bot_id && b.botId && e.bot_id === b.botId) return b;
+    if (e.user && b.userId && e.user === b.userId) return b;
+  }
+  return null;
+}
+function privroomKey(channel, ts) {
+  return `privroom:${channel}:${ts}`;
+}
+function missingNameSlots(names, replied) {
+  const left = names.slice();
+  for (const name of replied || []) {
+    const i = left.indexOf(name);
+    if (i >= 0) left.splice(i, 1);
+  }
+  return left;
+}
+async function armPrivroomSynth(env, { channel, ts, invoker, question }) {
+  if (!privroomSynthEnabled(env)) return;
+  if (!env.PRIVROOM_STATE || !env.PRIVROOM_SYNTH) {
+    log("privroom synth skipped: missing PRIVROOM_STATE or PRIVROOM_SYNTH binding");
+    return;
+  }
+  const record = { channel, ts, invoker, question, replied: [], seen: [], synthesized: false, createdAt: Date.now() };
+  await env.PRIVROOM_STATE.put(privroomKey(channel, ts), JSON.stringify(record), { expirationTtl: 7200 });
+  await env.PRIVROOM_SYNTH.send({ channel, ts }, { delaySeconds: privroomDelaySeconds(env) });
+  log("privroom armed", channel, ts, `delay=${privroomDelaySeconds(env)}s`);
+}
+async function claimPrivroomSynth(env, channel, ts, reason) {
+  if (!env.PRIVROOM_STATE) return null;
+  const key = privroomKey(channel, ts);
+  const lockKey = `privroom:lock:${channel}:${ts}`;
+  if (await env.PRIVROOM_STATE.get(lockKey)) return null;
+  await env.PRIVROOM_STATE.put(lockKey, reason || "claimed", { expirationTtl: 7200 });
+  const raw = await env.PRIVROOM_STATE.get(key);
+  if (!raw) return null;
+  let rec;
+  try { rec = JSON.parse(raw); } catch { return null; }
+  if (rec.synthesized) return null;
+  rec.synthesized = true;
+  rec.synthesizedAt = Date.now();
+  rec.reason = reason || "unknown";
+  await env.PRIVROOM_STATE.put(key, JSON.stringify(rec), { expirationTtl: 7200 });
+  return rec;
+}
+export function buildPrivroomSynthPayload(env, rec, reason) {
+  const replied = Array.isArray(rec.replied) ? rec.replied : [];
+  const names = privroomBotsOf(env).map((b) => b.name);
+  return {
+    source: env.BRIDGE_SOURCE || env.source || "slack-bridge-example",
+    kind: "privroom_synthesize",
+    channel: rec.channel,
+    thread_ts: rec.ts,
+    question: rec.question,
+    invoker: rec.invoker,
+    replied,
+    missing: missingNameSlots(names, replied),
+    reason: reason || rec.reason || null,
+  };
+}
+async function firePrivroomSynthesize(env, rec, reason) {
+  const payload = buildPrivroomSynthPayload(env, rec, reason);
+  if (String(env.PRIVROOM_SYNTH_DRY_RUN || "") === "1") {
+    log("privroom synthesize DRY_RUN", reason, rec.channel, rec.ts);
+    return payload;
+  }
+  await wakeGrok(env, payload);
+  log("privroom synthesize wake", reason, rec.channel, rec.ts);
+  return payload;
+}
+async function tryPrivroomSynthesize(env, channel, ts, reason) {
+  if (!privroomSynthEnabled(env)) return false;
+  const rec = await claimPrivroomSynth(env, channel, ts, reason);
+  if (!rec) return false;
+  try {
+    await firePrivroomSynthesize(env, rec, reason);
+    return true;
+  } catch (err) {
+    log("privroom synthesize wake FAILED", reason, channel, ts, err?.message || err);
+    try {
+      await env.PRIVROOM_STATE.delete(`privroom:lock:${channel}:${ts}`);
+      const key = privroomKey(channel, ts);
+      const raw = await env.PRIVROOM_STATE.get(key);
+      if (raw) {
+        const row = JSON.parse(raw);
+        row.synthesized = false;
+        delete row.synthesizedAt;
+        delete row.reason;
+        await env.PRIVROOM_STATE.put(key, JSON.stringify(row), { expirationTtl: 7200 });
+      }
+    } catch { /* unlock is best-effort */ }
+    throw err;
+  }
+}
+async function onPrivroomBotReply(env, e, bot) {
+  if (!privroomSynthEnabled(env) || !env.PRIVROOM_STATE) return;
+  const threadTs = e.thread_ts;
+  if (!threadTs || threadTs === e.ts) return;
+  const key = privroomKey(e.channel, threadTs);
+  const raw = await env.PRIVROOM_STATE.get(key);
+  if (!raw) return;
+  let rec;
+  try { rec = JSON.parse(raw); } catch { return; }
+  if (rec.synthesized) return;
+  const seen = Array.isArray(rec.seen) ? rec.seen.slice() : [];
+  const id = `${bot.userId || ""}:${bot.botId || ""}`;
+  if (seen.includes(id)) return;
+  seen.push(id);
+  const names = privroomBotsOf(env).map((b) => b.name);
+  const replied = Array.isArray(rec.replied) ? rec.replied.slice() : [];
+  if (missingNameSlots(names, replied).includes(bot.name)) replied.push(bot.name);
+  rec.replied = replied;
+  rec.seen = seen;
+  await env.PRIVROOM_STATE.put(key, JSON.stringify(rec), { expirationTtl: 7200 });
+  log("privroom reply noted", bot.name, e.channel, threadTs);
+  if (missingNameSlots(names, replied).length === 0) {
+    await tryPrivroomSynthesize(env, e.channel, threadTs, "all_replied");
+  }
+}
+async function handleCommand(request, env, ctx) {
+  if (!env.SLACK_SIGNING_SECRET) return json({ ok: false, error: "signing secret not configured" }, 503);
+  const raw = await request.text();
+  const bad = await verifySlack(request, raw, env.SLACK_SIGNING_SECRET);
+  if (bad) return json({ ok: false, error: bad }, 401);
+  const f = new URLSearchParams(raw);
+  if (f.get("command") !== "/privroom") return json({ response_type: "ephemeral", text: "Unknown command" });
+  const text = (f.get("text") || "").trim();
+  if (!text) return json({ response_type: "ephemeral", text: "Usage: /privroom <question>" });
+  const channel = f.get("channel_id");
+  const user = f.get("user_id");
+  if (isSilentEvent(env, { channel })) return json({ response_type: "ephemeral", text: "This channel is muted." });
+  const msg = `${privroomTags(env)} from: <@${user}>. ${text}`.trim();
+  const r = await slackApi(env, "chat.postMessage", { channel, text: msg });
+  if (!r?.ok || !r.ts) return json({ response_type: "ephemeral", text: "Could not post." });
+  if (ctx && privroomSynthEnabled(env)) {
+    ctx.waitUntil(armPrivroomSynth(env, { channel, ts: r.ts, invoker: user, question: text }).catch((err) => log("privroom arm error", err?.message || err)));
+  }
+  return json({ response_type: "ephemeral", text: "Sent" });
+}
+
+// Assistant / agent panel. Greeting and prompts are config; nothing here is a
+// workspace name. Suggested prompts omit thread_ts unless
+// ASSISTANT_PROMPTS_IN_THREAD=1, because an agent app silently drops the call
+// when thread_ts is present. Legacy assistant containers can opt in.
+const DEFAULT_ASSISTANT_GREETING = "Hi. Ask a question, or choose a prompt.";
+const DEFAULT_ASSISTANT_PROMPTS_TITLE = "Try one of these";
+const DEFAULT_ASSISTANT_PROMPTS = [
+  { title: "Ask a question", message: "What can you help me with?" },
+  { title: "Summarize the channel", message: "Summarize what I should know from the channel I am viewing." },
+];
+const ASSISTANT_CONTEXT_TTL_SECONDS = 30 * 24 * 3600;
+
+export function assistantPanelEnabled(env) {
+  const v = String(env?.ASSISTANT_PANEL ?? "1").toLowerCase();
+  return v !== "0" && v !== "false" && v !== "off";
+}
+export function assistantGreetingOf(env) {
+  if (env?.ASSISTANT_GREETING === undefined || env?.ASSISTANT_GREETING === null) return DEFAULT_ASSISTANT_GREETING;
+  const text = String(env.ASSISTANT_GREETING).trim();
+  if (!text || /^(off|false|none|0)$/i.test(text)) return "";
+  return text;
+}
+export function assistantPromptsTitleOf(env) {
+  const text = String(env?.ASSISTANT_PROMPTS_TITLE ?? "").trim();
+  return text || DEFAULT_ASSISTANT_PROMPTS_TITLE;
+}
+export function assistantPromptsOf(env) {
+  const raw = env?.ASSISTANT_PROMPTS;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return DEFAULT_ASSISTANT_PROMPTS.map((p) => ({ ...p }));
+  let arr;
+  try { arr = JSON.parse(String(raw)); } catch { return DEFAULT_ASSISTANT_PROMPTS.map((p) => ({ ...p })); }
+  if (!Array.isArray(arr)) return DEFAULT_ASSISTANT_PROMPTS.map((p) => ({ ...p }));
+  const prompts = [];
+  for (const p of arr) {
+    if (!p || !p.title || !p.message) continue;
+    prompts.push({ title: String(p.title), message: String(p.message) });
+    if (prompts.length >= 4) break;
+  }
+  return prompts.length ? prompts : DEFAULT_ASSISTANT_PROMPTS.map((p) => ({ ...p }));
+}
+export function assistantPromptsInThread(env) {
+  const v = String(env?.ASSISTANT_PROMPTS_IN_THREAD ?? "").toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+export function suggestedPromptsArgs(env, channelId, threadTs) {
+  const body = {
+    channel_id: channelId,
+    title: assistantPromptsTitleOf(env),
+    prompts: assistantPromptsOf(env),
+  };
+  if (assistantPromptsInThread(env) && threadTs) body.thread_ts = String(threadTs);
+  return body;
+}
+
+function entityChannelId(value) {
+  if (!value || typeof value !== "object") return null;
+  return value.channel_id ? String(value.channel_id) : null;
+}
+/** Viewed-channel context from either assistant_thread.context or agent entities. Drops unknown fields. */
+export function viewedContextOf(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const entities = [];
+  if (Array.isArray(raw.entities)) {
+    for (const e of raw.entities) {
+      if (!e || typeof e !== "object") continue;
+      const row = {};
+      if (e.type) row.type = String(e.type);
+      if (typeof e.value === "string" || typeof e.value === "number") row.value = String(e.value);
+      if (e.team_id) row.team_id = String(e.team_id);
+      const nested = entityChannelId(e.value);
+      if (nested) row.channel_id = nested;
+      if (e.value && typeof e.value === "object" && e.value.message_ts) row.message_ts = String(e.value.message_ts);
+      if (e.channel_id) row.channel_id = String(e.channel_id);
+      if (row.type || row.value || row.channel_id) entities.push(row);
+      if (entities.length >= 8) break;
+    }
+  }
+  const fromEntity = entities.find((e) => e.channel_id)?.channel_id
+    || entities.find((e) => typeof e.value === "string" && /^[CDG]/.test(e.value))?.value
+    || null;
+  const channel_id = raw.channel_id ? String(raw.channel_id) : fromEntity;
+  const team_id = raw.team_id ? String(raw.team_id) : (entities.find((e) => e.team_id)?.team_id || null);
+  const enterprise_id = raw.enterprise_id ? String(raw.enterprise_id) : null;
+  if (!channel_id && !team_id && !enterprise_id && !entities.length) return null;
+  const out = {};
+  if (channel_id) out.channel_id = channel_id;
+  if (team_id) out.team_id = team_id;
+  if (enterprise_id) out.enterprise_id = enterprise_id;
+  if (entities.length) out.entities = entities;
+  return out;
+}
+export function inlineViewedContext(event) {
+  if (!event || typeof event !== "object") return null;
+  return viewedContextOf(event.app_context) || viewedContextOf(event.context);
+}
+/** Parent thread on a DM. A missing thread_ts, or thread_ts equal to ts, is a top-level DM. */
+export function assistantParentTs(event) {
+  if (!event?.thread_ts || event.thread_ts === event.ts) return null;
+  return String(event.thread_ts);
+}
+export function isAssistantControlEvent(event) {
+  const t = event?.type;
+  return t === "assistant_thread_started"
+    || t === "assistant_thread_context_changed"
+    || t === "app_context_changed"
+    || t === "app_home_opened";
+}
+const assistantThreadKey = (channel, thread) => `assistant:${channel}:${thread}`;
+const assistantUserKey = (user) => `assistant-user:${user}`;
+const assistantGreetedKey = (channel) => `assistant-greeted:${channel}`;
+
+async function putAssistant(env, key, record) {
+  await env.PRIVROOM_STATE.put(key, JSON.stringify(record), { expirationTtl: ASSISTANT_CONTEXT_TTL_SECONDS });
+}
+async function saveAssistantContext(env, { channelId, threadTs, userId, context }) {
+  if (!assistantPanelEnabled(env) || !env?.PRIVROOM_STATE || !context) return;
+  const record = {
+    context,
+    at: Date.now(),
+    channel_id: channelId || null,
+    thread_ts: threadTs || null,
+    user_id: userId || null,
+  };
+  if (channelId && threadTs) await putAssistant(env, assistantThreadKey(channelId, threadTs), record);
+  if (userId) await putAssistant(env, assistantUserKey(userId), record);
+}
+async function readAssistantRecord(env, key) {
+  if (!env?.PRIVROOM_STATE) return null;
+  const raw = await env.PRIVROOM_STATE.get(key);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+/** Context for a DM wake. Ordinary top-level DMs with no inline context stay unchanged. */
+export async function assistantForWake(env, event) {
+  if (!assistantPanelEnabled(env) || !event) return null;
+  const channel = String(event.channel || "");
+  const isDm = event.channel_type === "im" || channel.startsWith("D");
+  if (!isDm) return null;
+  if (event.bot_id || event.subtype === "bot_message") return null;
+  if (event.user && env && cfg(env).ownUserId && event.user === cfg(env).ownUserId) return null;
+  const threadTs = assistantParentTs(event);
+  const inline = inlineViewedContext(event);
+  if (inline) await saveAssistantContext(env, { channelId: channel, threadTs, userId: event.user, context: inline });
+  let stored = null;
+  if (threadTs) stored = await readAssistantRecord(env, assistantThreadKey(channel, threadTs));
+  if (!stored?.context && threadTs && event.user) {
+    const fromUser = await readAssistantRecord(env, assistantUserKey(event.user));
+    if (fromUser?.context) {
+      stored = fromUser;
+      await saveAssistantContext(env, { channelId: channel, threadTs, userId: event.user, context: fromUser.context });
+    }
+  }
+  const context = inline || stored?.context || null;
+  if (!threadTs && !inline) return null;
+  return { thread_ts: threadTs, channel_id: channel, context };
+}
+
+async function postAssistantGreeting(env, channel, threadTs) {
+  const text = assistantGreetingOf(env);
+  if (!text || !channel || isSilentEvent(env, { channel })) return;
+  const body = { channel, text };
+  if (threadTs) body.thread_ts = threadTs;
+  await slackApi(env, "chat.postMessage", body);
+}
+async function setAssistantPrompts(env, channelId, threadTs) {
+  if (!channelId || isSilentEvent(env, { channel: channelId })) return;
+  await slackApi(env, "assistant.threads.setSuggestedPrompts", suggestedPromptsArgs(env, channelId, threadTs));
+}
+
+export async function handleAssistantEvent(env, event, authUserId) {
+  if (!assistantPanelEnabled(env) || !event) return;
+  if (isSilentEvent(env, event)) return;
+  if (event.type === "assistant_thread_started" || event.type === "assistant_thread_context_changed") {
+    const thread = event.assistant_thread || {};
+    const channelId = thread.channel_id ? String(thread.channel_id) : "";
+    const threadTs = thread.thread_ts ? String(thread.thread_ts) : "";
+    if (!channelId || isSilentEvent(env, { channel: channelId })) return;
+    const context = viewedContextOf(thread.context);
+    if (context) await saveAssistantContext(env, { channelId, threadTs, userId: thread.user_id, context });
+    if (event.type === "assistant_thread_context_changed") return;
+    await postAssistantGreeting(env, channelId, threadTs || null);
+    await setAssistantPrompts(env, channelId, threadTs || null);
+    return;
+  }
+  if (event.type === "app_context_changed") {
+    const context = viewedContextOf(event.context);
+    const userId = event.user || authUserId || null;
+    if (context && userId) await saveAssistantContext(env, { userId, context });
+    return;
+  }
+  if (event.type !== "app_home_opened" || event.tab !== "messages") return;
+  const channel = event.channel ? String(event.channel) : "";
+  if (!channel || isSilentEvent(env, { channel })) return;
+  const context = viewedContextOf(event.context);
+  if (context && event.user) await saveAssistantContext(env, { userId: event.user, context });
+  await setAssistantPrompts(env, channel, null);
+  if (!assistantGreetingOf(env) || !env?.PRIVROOM_STATE) return;
+  const mark = assistantGreetedKey(channel);
+  if (await env.PRIVROOM_STATE.get(mark)) return;
+  await putAssistant(env, mark, { at: Date.now() });
+  await postAssistantGreeting(env, channel, null);
+}
+
 async function handle(env, c, e, action) {
+  if (isSilentEvent(env, e)) return;
   if (action === "welcome") return welcome(env, c, e);
   if (action === "wake_mention" && await botCapReached(env, c, e)) {
     log("bot reply cap reached; ignoring", e.bot_id, e.channel, e.thread_ts);
@@ -496,8 +1040,22 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-      return json({ ok: true, service: "slack-bridge-example", configured: !!(env.SLACK_SIGNING_SECRET && env.GROK_WEBHOOK_URL && env.SLACK_BOT_TOKEN) });
+      return json({
+        ok: true,
+        service: "slack-bridge-example",
+        configured: !!(env.SLACK_SIGNING_SECRET && env.GROK_WEBHOOK_URL && env.SLACK_BOT_TOKEN),
+        privroom_synthesize: privroomSynthEnabled(env),
+        assistant_panel: assistantPanelEnabled(env),
+      });
     }
+    if (request.method === "POST" && url.pathname === "/internal/privroom-selftest") {
+      if (String(env.PRIVROOM_SELFTEST || "") !== "1") return json({ ok: false, error: "selftest disabled" }, 404);
+      const auth = request.headers.get("Authorization") || "";
+      const secret = env.GROK_WEBHOOK_SECRET || "";
+      if (!secret || auth !== `Bearer ${secret}`) return json({ ok: false, error: "unauthorized" }, 401);
+      return json({ ok: false, error: "selftest disabled" }, 404);
+    }
+    if (request.method === "POST" && url.pathname === "/slack/commands") return handleCommand(request, env, ctx);
     if (request.method !== "POST" || !(url.pathname === "/" || url.pathname === "/slack/events")) {
       return new Response("not found", { status: 404 });
     }
@@ -514,6 +1072,38 @@ export default {
     // Slack's one-time Request URL handshake (the reason a plain routine webhook can't be used).
     if (body.type === "url_verification") return json({ challenge: body.challenge });
     if (body.type !== "event_callback") return json({ ok: true, action: "ignore", reason: `type:${body.type}` });
+
+    // Mute before auth.test, ack, thinking, hold-ack, welcome, wake, or public ingest.
+    // Covers app_mention (including edited), message, message_changed, joins,
+    // member_joined_channel, threads, and retries. HTTP 200 is the Slack
+    // protocol ack only. Optional SILENT_RECORD writes an isolated Honcho
+    // session and never attaches it to a wake.
+    if (isSilentEvent(env, body.event)) {
+      const e = body.event;
+      log("silent", body.event_id, e?.type, e?.subtype || "", eventChannelId(e), e?.ts || e?.message?.ts || "", e?.edited ? "edited" : "");
+      const recordTask = scheduleSilentRecord(env, e);
+      if (recordTask) ctx.waitUntil(recordTask);
+      return json({ ok: true, action: "ignore", reason: "silent" }, 200, { "X-Relay-Action": "ignore:silent" });
+    }
+
+    // Panel control events are not wakes. Mute already returned when event.channel
+    // is listed. The handler also refuses a muted assistant DM.
+    if (isAssistantControlEvent(body.event)) {
+      const authUser = Array.isArray(body.authorizations)
+        ? (body.authorizations.find((a) => a && a.user_id)?.user_id || null)
+        : null;
+      log("assistant", body.event_id, body.event.type, body.event.assistant_thread?.channel_id || body.event.channel || "");
+      ctx.waitUntil(handleAssistantEvent(env, body.event, authUser).catch((err) => log("assistant error", err?.message || err)));
+      return json({ ok: true, action: "assistant", reason: body.event.type }, 200, { "X-Relay-Action": `assistant:${body.event.type}` });
+    }
+
+    // Explicit 1:1 search only. A deny or a normal DM does not fetch record sessions.
+    const search = classifyRecordSearch(env, body.event);
+    if (search.kind === "allow") {
+      log("record search", search.channelId, search.requesterId, body.event?.channel);
+      ctx.waitUntil(deliverRecordSearch(env, body.event, search).catch((err) => log("record search failed", err?.message || err)));
+      return json({ ok: true, action: "record_search", reason: "im" }, 200, { "X-Relay-Action": "record-search:im" });
+    }
 
     await ensureSelf(env);
     const c = cfg(env);
@@ -534,6 +1124,30 @@ export default {
     const honchoTask = scheduleHoncho(env, c, e);
     if (action !== "ignore") ctx.waitUntil(handle(env, c, e, action).catch((err) => log("handler error", err?.message || err)));
     if (honchoTask) ctx.waitUntil(honchoTask);
+    if (stickyEnabled(env) && env.PRIVROOM_STATE && action === "ignore") {
+      ctx.waitUntil(applySticky(env, c, e).catch((err) => log("sticky error", err?.message || err)));
+    } else if (stickyEnabled(env) && env.PRIVROOM_STATE && e?.type === "app_mention") {
+      ctx.waitUntil(applySticky(env, c, e).catch((err) => log("sticky error", err?.message || err)));
+    }
+    if (privroomSynthEnabled(env) && e && e.type === "message" && e.thread_ts && e.thread_ts !== e.ts) {
+      const bot = matchPrivroomBot(e, env);
+      if (bot) ctx.waitUntil(onPrivroomBotReply(env, e, bot).catch((err) => log("privroom reply error", err?.message || err)));
+    }
     return json({ ok: true }, 200, { "X-Relay-Action": `${action}:${reason}` });
+  },
+
+  async queue(batch, env) {
+    for (const msg of batch.messages) {
+      try {
+        if (!privroomSynthEnabled(env)) { msg.ack(); continue; }
+        const body = msg.body || {};
+        if (!body.channel || !body.ts) { msg.ack(); continue; }
+        await tryPrivroomSynthesize(env, body.channel, body.ts, "timer");
+        msg.ack();
+      } catch (err) {
+        log("privroom queue error", err?.message || err);
+        msg.retry();
+      }
+    }
   },
 };

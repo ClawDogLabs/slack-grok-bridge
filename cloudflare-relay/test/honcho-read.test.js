@@ -54,7 +54,8 @@ test("happy path returns one channel session context", async () => {
   assert.equal(ctx.sessionId, "channel-Cpublic1");
   assert.equal(ctx.summary, "Discussed the lab readout.");
   assert.equal(ctx.peer_representation, "A careful reviewer.");
-  assert.deepEqual(ctx.peer_card, ["asks short questions", "checks plots"]);
+  assert.equal(ctx.peer_card, null);
+  assert.equal(ctx.scope, "public");
   assert.deepEqual(ctx.recent, ["first line", "second line"]);
   assert.equal(calls.length, 1);
   const url = new URL(calls[0].url);
@@ -62,7 +63,8 @@ test("happy path returns one channel session context", async () => {
     `${url.origin}${url.pathname}`,
     "https://api.honcho.dev/v3/workspaces/example-workspace/sessions/channel-Cpublic1/context",
   );
-  assert.equal(url.searchParams.get("tokens"), "1200");
+  assert.equal(url.searchParams.get("tokens"), "3000");
+  assert.equal(url.searchParams.get("limit_to_session"), "true");
   assert.equal(url.searchParams.get("summary"), "true");
   assert.equal(url.searchParams.get("peer_target"), "Uhuman1");
   assert.equal(calls[0].opts.method, "GET");
