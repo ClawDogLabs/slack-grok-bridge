@@ -43,10 +43,11 @@ Same routing and headers as the bridge. The webhook body adds a `reply` object; 
   the message is already in a thread. Channel events get `reply_broadcast: true` on the
   hint, including follow-ups. The routine broadcasts only the first answer to a human
   ask that @mentions exactly one bot; multi-bot asks and follow-ups stay in the thread.
-  A `kind: "privroom_synthesize"` reply may still broadcast. The 1:1 and agent-panel
-  policy is separate: the routine picks `reply.thread_ts`, then `slack.thread_ts`, then
-  `slack.ts`, so a top-level ask starts a topic thread. See the
-  top-level README. `app_mention` has no `channel_type`; the Worker calls `conversations.info`
+  A `kind: "privroom_synthesize"` reply may still broadcast. The answer path is
+  `routing`, not that hint. A top-level 1:1 is `routing.surface` `im` with
+  `reply_thread_ts` null. An existing DM thread is `im_thread`. `assistant_thread`
+  is only a thread Slack named. See the top-level README. `app_mention` has no
+  `channel_type`; the Worker calls `conversations.info`
   when it can (`channels:read`, `groups:read`, `im:read`, or `mpim:read`). If that call
   fails, the mention is treated as a channel.
 - Bots (including itself), edits, deletes and other subtypes are ignored, except `file_share`
@@ -60,8 +61,8 @@ Same routing and headers as the bridge. The webhook body adds a `reply` object; 
 Webhook request (identical to the bridge):
 `POST GROK_WEBHOOK_URL` with `Authorization: Bearer <GROK_WEBHOOK_SECRET>` and
 `X-Automation-Key: <GROK_WEBHOOK_SECRET>`, body
-`{ source, kind, slack: { type, user, user_name, user_real_name, user_display_name, channel, channel_type, ts, thread_ts, text, subtype, files }, hold_ack, reply }`.
-`reply` is `{ thread_ts, reply_broadcast }`. `thread_ts` is null on a top-level 1:1 hint. The routine still starts a topic thread from `slack.ts` in that case. Group DMs keep the hint as posted. On a channel, `reply_broadcast: true` is only the hint; the routine broadcasts the first single-bot answer and a private-room synthesis reply, not every follow-up.
+`{ source, kind, slack, hold_ack, reply, routing }`.
+`reply` is the relay's own placement hint. `routing` is `{ surface, panel, provenance, reply_thread_ts, reply_broadcast, context, viewed, viewed_source }`. Post the answer from `routing`. On a channel, `reply.reply_broadcast` can still be true for a follow-up; `routing.reply_broadcast` is true only for the first single-bot answer. A private-room synthesis wake is separate and may still broadcast.
 
 ### More config
 
@@ -179,7 +180,7 @@ A thread this bot owns wakes on a later human reply that does not @mention anyon
 
 A post that only replies inside an existing thread (`thread_ts` different from `ts`) does not take that thread. If a mark is already stored, a later root event does not replace it. An @mention of someone else wakes with `sticky_other_tag: true` and leaves the mark in place, so the next untagged human reply still wakes. Messages from any bot, including this one, never wake.
 
-`STICKY_THREADS=0`, `false`, or `off` disables it. The KV binding has to be named `PRIVROOM_STATE`. `OWN_USER_ID` (or a successful `auth.test`) has to identify this bot. `message.channels` must be subscribed or Slack will not deliver the bot's own root post; private channels need `message.groups` as well. No separate callback from the reply routine is required. A conversation this bot opens, rather than an answer in a 1:1 topic, is a top-level `chat.postMessage` with no `thread_ts`. A send that sets `thread_ts` is a reply and does not claim. Muted channels return before this runs, so they neither claim nor wake. `SILENT_RECORD`, `ACK_REACTION`, and `HOLD_ACK` are independent: leave them as set in untracked runtime config. `HOLD_ACK` stays off unless that var is true. The ack reaction stays whatever `ACK_REACTION` names.
+`STICKY_THREADS=0`, `false`, or `off` disables it. The KV binding has to be named `PRIVROOM_STATE`. `OWN_USER_ID` (or a successful `auth.test`) has to identify this bot. `message.channels` must be subscribed or Slack will not deliver the bot's own root post; private channels need `message.groups` as well. No separate callback from the reply routine is required. A conversation this bot opens on its own is a top-level `chat.postMessage` with no `thread_ts`. A 1:1 answer uses `routing` instead. A send that sets `thread_ts` is a reply and does not claim. Muted channels return before this runs, so they neither claim nor wake. `SILENT_RECORD`, `ACK_REACTION`, and `HOLD_ACK` are independent: leave them as set in untracked runtime config. `HOLD_ACK` stays off unless that var is true. The ack reaction stays whatever `ACK_REACTION` names.
 
 ## Assistant panel
 
@@ -188,9 +189,10 @@ Slack's agent and assistant container is a DM. This Worker does not wake on `ass
 - `assistant_thread_started` posts `ASSISTANT_GREETING` into that thread and calls `assistant.threads.setSuggestedPrompts`. The greeting default is `Hi. Ask a question, or choose a prompt.` Prompts default to two generic ones. `ASSISTANT_PROMPTS` is a JSON list of `{title, message}` (at most four). `ASSISTANT_GREETING=off` skips the post. `ASSISTANT_PANEL=0` skips all of this.
 - Prompts omit `thread_ts`. Agents & AI Apps silently ignore the call when `thread_ts` is set. Set `ASSISTANT_PROMPTS_IN_THREAD=1` only for a legacy assistant container.
 - `app_home_opened` with `tab` `messages` refreshes those prompts and posts the greeting once per DM, which is how an agent app learns the Messages tab was opened. The Home tab is ignored. The once-only mark needs `PRIVROOM_STATE`.
-- `assistant_thread_context_changed` stores the viewed channel on `PRIVROOM_STATE` at `assistant:<dm channel>:<thread ts>` for 30 days. It does not post and does not read that channel. `app_context_changed` stores the same kind of context for the authorized user. A later reply in an assistant thread copies it onto that thread.
-- A `message.im` that has a parent `thread_ts` (different from its own `ts`) wakes with `reply.thread_ts` set to that parent, `reply.reply_broadcast` false, and `assistant.context` when a viewed channel is known. The routine posts into that thread.
-- A 1:1 with no parent still wakes with `reply.thread_ts` null. Routine policy, not this Worker, then uses `slack.ts` as the topic root so the ask is not answered at the top level. If that message carries `app_context` or `context`, the wake includes `assistant.context`. Ordinary replies stay in the topic. An opt-in delayed final completion may set `reply_broadcast` on that same root.
+- `assistant_thread_context_changed` stores the viewed channel only on `assistant:<dm channel>:<thread ts>` for 30 days, and only when both ids are present. It does not post and does not read that channel. `app_context_changed` has no thread id. The Worker drops it. It is not applied to a later DM.
+- A `message.im` in a thread Slack named that way wakes with `routing.surface` `assistant_thread`, `routing.reply_broadcast` false, and `assistant.context` from that thread only. The routine posts into that thread, including a delayed result, and does not copy it to the main DM.
+- Any other DM thread is `routing.surface` `im_thread`. Answer in that thread. Do not attach panel context, even if a per-user record or a different thread has one.
+- A top-level `message.im` is `routing.surface` `im` with `reply_thread_ts` null, including a Messages-tab message that has no `assistant_thread` field. If that event includes `app_context` or `context`, `routing.viewed` carries it and `viewed_source` is `event`. The next message does not inherit it. A delayed result stays in the main DM and is not broadcast.
 - While that wake runs, the Worker calls `assistant.threads.setStatus` with `is thinking…` on the DM thread, then clears it with an empty status after the webhook returns. The ack reaction and `HOLD_ACK` are unchanged. `HOLD_ACK` stays off unless set true.
 - The bot's own messages, including the greeting, do not wake.
 
@@ -216,7 +218,7 @@ SILENT_CHANNEL_READERS = "C0SYNTH0001:U0SYNTH0001|U0SYNTH0002|U0SYNTH0003|U0SYNT
 SILENT_GROK_READER_IDS = "U0SYNTH0001"
 ```
 
-An allowed 1:1 DM gets one `chat.postMessage` back from the Worker in that DM (no `reply_broadcast`, no reaction, no wake). That lookup reply is not the routine's topic thread. Other surfaces get nothing from this store. The configured owner's private Grok chat can call `queryRecordSession(env, { source: "owner-grok", requesterId, channelId })`, which returns session messages and null peer fields. Do not expose that function on HTTP. Render it only in that chat.
+An allowed 1:1 DM gets one `chat.postMessage` back from the Worker in that DM (no `reply_broadcast`, no reaction, no wake). That lookup reply is the Worker's own message, not the routine's answer route. Other surfaces get nothing from this store. The configured owner's private Grok chat can call `queryRecordSession(env, { source: "owner-grok", requesterId, channelId })`, which returns session messages and null peer fields. Do not expose that function on HTTP. Render it only in that chat.
 
 ### Catch-up since channel creation
 

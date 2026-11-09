@@ -268,16 +268,19 @@ Use e.g. **`:21` / `:51`** past the hour (twice-hourly weekday daytime). `ensure
 ## Outbound replies
 
 - **Human ack before send** unless standing permission for that channel/use
-- `reply` is where the relay posts its own messages. For a 1:1 answer, this routine picks `thread_ts` itself: `reply.thread_ts`, then `slack.thread_ts` when it differs from `slack.ts`, then `slack.ts`. That starts a topic thread for a top-level ask. Later replies and progress stay in the thread and omit `reply_broadcast`.
-- **Opt-in only:** the delayed final completion of a long job may set `reply_broadcast: true` on that same topic `thread_ts`.
-- **Group DMs:** `channel` only, unless the message is already in a thread. Do not set `reply_broadcast`.
-- **Channels:** the relay hint often sets `reply_broadcast` true. This routine broadcasts only the first answer to a human ask that @mentions exactly one bot. Multi-bot asks and follow-ups stay in the thread. A `kind: "privroom_synthesize"` reply may still broadcast. That flag is per message, **not** a YAML/manifest setting. Do not apply the 1:1 topic rule to that synthesize wake.
+- Follow `routing`, not `reply.reply_broadcast`. A top-level 1:1 (`routing.surface` `im`) is `chat.postMessage` with `channel` only. No `thread_ts`, no `reply_broadcast`.
+- An existing DM thread (`im_thread`) and a Slack-named panel thread (`assistant_thread`) reply only in `routing.reply_thread_ts`. A later result uses that same thread and is not copied to the main DM.
+- **Group DMs:** `channel` only, unless `routing.reply_thread_ts` is set. Do not set `reply_broadcast`.
+- **Channels:** broadcast only the first answer to a human ask that @mentions exactly one known bot (`routing.reply_broadcast`). Multi-bot asks and follow-ups stay in the thread. A `kind: "privroom_synthesize"` reply may still broadcast. That flag is per message, **not** a YAML/manifest setting.
 
 ```js
-// 1:1 topic reply. Omit reply_broadcast except on an opt-in delayed final.
+// Top-level 1:1. No thread_ts.
+await client.chat.postMessage({ channel, text: replyText });
+
+// Existing DM thread or a named panel thread.
 await client.chat.postMessage({
   channel,
-  thread_ts: threadTs,
+  thread_ts: routing.reply_thread_ts,
   text: replyText,
 });
 
@@ -306,7 +309,7 @@ await client.chat.postMessage({
 | Own webhook routine + `GROK_WEBHOOK_*` | URL + sender key in `.env`; Bearer + X-Automation-Key |
 | `npm install` + `./start.sh` | `bridge.log` shows Socket Mode |
 | Keep-alive | Weekday daytime `ensure-running` |
-| Invite + smoke `@mention` | Bot reacts and wakes. The first channel answer to a single-bot ask uses `thread_ts` + `reply_broadcast`. A 1:1 reply uses the topic `thread_ts` and stays in the thread. |
+| Invite + smoke `@mention` | Bot reacts and wakes. The first channel answer to a single-bot ask uses `thread_ts` + `reply_broadcast`. A top-level 1:1 reply omits `thread_ts`. |
 
 ---
 

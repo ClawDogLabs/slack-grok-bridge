@@ -29,10 +29,12 @@
  * reply_broadcast in channels. The same placement is sent as `reply` on the webhook.
  *
  * Assistant / agent panel: assistant_thread_started posts ASSISTANT_GREETING and
- * sets suggested prompts. assistant_thread_context_changed (and app_context_changed)
- * stores the viewed channel on PRIVROOM_STATE. A DM that already has a parent
- * thread_ts wakes with that thread_ts and payload.assistant. A DM with no
- * thread_ts stays top-level. ASSISTANT_PANEL=0 disables the panel extras.
+ * sets suggested prompts. Only that event, or assistant_thread_context_changed
+ * with the same channel and thread_ts, marks a panel thread. A top-level 1:1
+ * wakes with no thread_ts. A DM that already has a parent thread stays in it.
+ * app_context_changed is not copied onto later DMs. ASSISTANT_PANEL=0 disables
+ * the panel extras. Consumers should follow payload.routing, not assume every
+ * threaded DM is the panel.
  *
  * Every request is answered fast (200 within ms); slow work runs in ctx.waitUntil so Slack's
  * 3-second deadline is never at risk.
@@ -440,11 +442,18 @@ async function processInbound(env, c, kind, e, sayOnFail, extra = null) {
       reply: placement,
     };
     if (honchoReadEnabled(env)) payload.honcho = await honchoForWake(env, e);
-    const assistant = await assistantForWake(env, e).catch((err) => {
-      log("assistant context", err?.message || err);
+    const routing = await routeSurface(env, e).catch((err) => {
+      log("routing", err?.message || err);
       return null;
     });
-    if (assistant) payload.assistant = assistant;
+    if (routing) payload.routing = routing;
+    if (routing?.panel) {
+      payload.assistant = {
+        thread_ts: routing.reply_thread_ts,
+        channel_id: channel,
+        context: routing.context,
+      };
+    }
     if (extra && typeof extra === "object") Object.assign(payload, extra);
     await wakeGrok(env, payload);
     log("wake ok", kind, channel, e.ts);
@@ -468,6 +477,8 @@ async function forwardWatched(env, c, e) {
   try {
     const slack = await summarizeEvent(env, e);
     const payload = { source: c.source, kind: "channel_message", watched: true, slack, reply: replyFields(e) };
+    const routing = await routeSurface(env, e).catch(() => null);
+    if (routing) payload.routing = routing;
     if (honchoReadEnabled(env)) payload.honcho = await honchoForWake(env, e);
     await wakeGrok(env, payload);
     log("wake ok", "channel_message", e.channel, e.ts);
@@ -923,23 +934,10 @@ export function isAssistantControlEvent(event) {
     || t === "app_home_opened";
 }
 const assistantThreadKey = (channel, thread) => `assistant:${channel}:${thread}`;
-const assistantUserKey = (user) => `assistant-user:${user}`;
 const assistantGreetedKey = (channel) => `assistant-greeted:${channel}`;
 
 async function putAssistant(env, key, record) {
   await env.PRIVROOM_STATE.put(key, JSON.stringify(record), { expirationTtl: ASSISTANT_CONTEXT_TTL_SECONDS });
-}
-async function saveAssistantContext(env, { channelId, threadTs, userId, context }) {
-  if (!assistantPanelEnabled(env) || !env?.PRIVROOM_STATE || !context) return;
-  const record = {
-    context,
-    at: Date.now(),
-    channel_id: channelId || null,
-    thread_ts: threadTs || null,
-    user_id: userId || null,
-  };
-  if (channelId && threadTs) await putAssistant(env, assistantThreadKey(channelId, threadTs), record);
-  if (userId) await putAssistant(env, assistantUserKey(userId), record);
 }
 async function readAssistantRecord(env, key) {
   if (!env?.PRIVROOM_STATE) return null;
@@ -948,29 +946,110 @@ async function readAssistantRecord(env, key) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
-/** Context for a DM wake. Ordinary top-level DMs with no inline context stay unchanged. */
-export async function assistantForWake(env, event) {
-  if (!assistantPanelEnabled(env) || !event) return null;
-  const channel = String(event.channel || "");
-  const isDm = event.channel_type === "im" || channel.startsWith("D");
-  if (!isDm) return null;
-  if (event.bot_id || event.subtype === "bot_message") return null;
-  if (event.user && env && cfg(env).ownUserId && event.user === cfg(env).ownUserId) return null;
-  const threadTs = assistantParentTs(event);
-  const inline = inlineViewedContext(event);
-  if (inline) await saveAssistantContext(env, { channelId: channel, threadTs, userId: event.user, context: inline });
-  let stored = null;
-  if (threadTs) stored = await readAssistantRecord(env, assistantThreadKey(channel, threadTs));
-  if (!stored?.context && threadTs && event.user) {
-    const fromUser = await readAssistantRecord(env, assistantUserKey(event.user));
-    if (fromUser?.context) {
-      stored = fromUser;
-      await saveAssistantContext(env, { channelId: channel, threadTs, userId: event.user, context: fromUser.context });
-    }
+/**
+ * Mark one Slack-named assistant thread. Never writes a per-user fallback.
+ * A later context update keeps the previous viewed channel when this event has none.
+ */
+export async function markAssistantThread(env, { channelId, threadTs, userId, context, source }) {
+  if (!assistantPanelEnabled(env) || !env?.PRIVROOM_STATE) return null;
+  if (!channelId || !threadTs) return null;
+  if (isSilentEvent(env, { channel: channelId })) return null;
+  const key = assistantThreadKey(channelId, threadTs);
+  const prev = await readAssistantRecord(env, key);
+  const trusted = prev?.panel === true && prev.channel_id === channelId && prev.thread_ts === threadTs;
+  const record = {
+    panel: true,
+    surface: "assistant_thread",
+    source: source || (trusted ? prev.source : null) || null,
+    context: context || (trusted ? prev.context : null) || null,
+    at: Date.now(),
+    channel_id: channelId,
+    thread_ts: threadTs,
+    user_id: userId || (trusted ? prev.user_id : null) || null,
+    greeted: trusted ? !!prev.greeted : false,
+  };
+  await putAssistant(env, key, record);
+  return record;
+}
+
+function knownBotIds(env) {
+  const ids = new Set();
+  const own = env ? cfg(env).ownUserId : null;
+  if (own) ids.add(own);
+  for (const bot of privroomBotsOf(env)) if (bot.userId) ids.add(bot.userId);
+  return ids;
+}
+
+/**
+ * Where a consumer should post. `reply` stays the relay's own hint.
+ * Panel is true only for a thread Slack named on assistant_thread_started
+ * or assistant_thread_context_changed. A per-user context record is ignored.
+ */
+export async function routeSurface(env, event) {
+  if (!event || typeof event !== "object") {
+    return { surface: "unknown", panel: false, provenance: "unknown", reply_thread_ts: null, reply_broadcast: false, context: null };
   }
-  const context = inline || stored?.context || null;
-  if (!threadTs && !inline) return null;
-  return { thread_ts: threadTs, channel_id: channel, context };
+  const channel = String(event.channel || "");
+  const ct = event.channel_type;
+  const parent = assistantParentTs(event);
+  const inline = inlineViewedContext(event);
+  const base = { panel: false, context: null, viewed: inline || null, viewed_source: inline ? "event" : null };
+
+  if (ct === "mpim") {
+    return { ...base, viewed: null, viewed_source: null, surface: "mpim", provenance: parent ? "incoming_thread" : "top_level", reply_thread_ts: parent, reply_broadcast: false };
+  }
+  const isDm = ct === "im" || (!ct && channel.startsWith("D"));
+  if (isDm) {
+    if (parent && assistantPanelEnabled(env)) {
+      const explicit = event.assistant_thread
+        && String(event.assistant_thread.thread_ts || "") === parent
+        && String(event.assistant_thread.channel_id || channel) === channel;
+      const rec = await readAssistantRecord(env, assistantThreadKey(channel, parent));
+      const trusted = rec?.panel === true && rec.channel_id === channel && rec.thread_ts === parent;
+      if (explicit || trusted) {
+        const fromEvent = explicit ? viewedContextOf(event.assistant_thread.context) : null;
+        return {
+          surface: "assistant_thread",
+          panel: true,
+          provenance: trusted ? "assistant_thread_record" : "event_assistant_thread",
+          reply_thread_ts: parent,
+          reply_broadcast: false,
+          context: fromEvent || (trusted ? rec.context : null) || null,
+          viewed: null,
+          viewed_source: null,
+        };
+      }
+    }
+    if (parent) {
+      return { ...base, surface: "im_thread", provenance: "incoming_thread", reply_thread_ts: parent, reply_broadcast: false, context: null };
+    }
+    return { ...base, surface: "im", provenance: "top_level", reply_thread_ts: null, reply_broadcast: false, context: null };
+  }
+  if (ct === "channel" || ct === "group" || (!ct && channel.startsWith("C"))) {
+    const followUp = !!parent;
+    const tags = [...new Set(taggedUserIds(event.text))];
+    const bots = knownBotIds(env);
+    const botTags = tags.filter((id) => bots.has(id));
+    const single = !followUp && botTags.length === 1;
+    return {
+      ...base,
+      viewed: null,
+      viewed_source: null,
+      surface: ct === "group" ? "group" : "channel",
+      provenance: followUp ? "incoming_thread" : "top_level",
+      reply_thread_ts: parent || (event.ts ? String(event.ts) : null),
+      reply_broadcast: single,
+      context: null,
+    };
+  }
+  return { ...base, viewed: null, viewed_source: null, surface: "unknown", provenance: "unknown", reply_thread_ts: null, reply_broadcast: false };
+}
+
+/** Panel context for a wake. Null unless this thread was named by Slack. */
+export async function assistantForWake(env, event) {
+  const routing = await routeSurface(env, event);
+  if (!routing?.panel) return null;
+  return { thread_ts: routing.reply_thread_ts, channel_id: String(event?.channel || ""), context: routing.context };
 }
 
 async function postAssistantGreeting(env, channel, threadTs) {
@@ -992,25 +1071,34 @@ export async function handleAssistantEvent(env, event, authUserId) {
     const thread = event.assistant_thread || {};
     const channelId = thread.channel_id ? String(thread.channel_id) : "";
     const threadTs = thread.thread_ts ? String(thread.thread_ts) : "";
-    if (!channelId || isSilentEvent(env, { channel: channelId })) return;
+    if (!channelId || !threadTs || isSilentEvent(env, { channel: channelId })) return;
     const context = viewedContextOf(thread.context);
-    if (context) await saveAssistantContext(env, { channelId, threadTs, userId: thread.user_id, context });
+    const record = await markAssistantThread(env, {
+      channelId,
+      threadTs,
+      userId: thread.user_id,
+      context,
+      source: event.type,
+    });
     if (event.type === "assistant_thread_context_changed") return;
-    await postAssistantGreeting(env, channelId, threadTs || null);
-    await setAssistantPrompts(env, channelId, threadTs || null);
+    if (record?.greeted) {
+      await setAssistantPrompts(env, channelId, threadTs);
+      return;
+    }
+    await postAssistantGreeting(env, channelId, threadTs);
+    if (record && env?.PRIVROOM_STATE) {
+      record.greeted = true;
+      await putAssistant(env, assistantThreadKey(channelId, threadTs), record);
+    }
+    await setAssistantPrompts(env, channelId, threadTs);
     return;
   }
-  if (event.type === "app_context_changed") {
-    const context = viewedContextOf(event.context);
-    const userId = event.user || authUserId || null;
-    if (context && userId) await saveAssistantContext(env, { userId, context });
-    return;
-  }
+  // Slack's agent event names the user in the outer authorizations list, not a thread.
+  // Do not store it for a later DM: that would relabel an ordinary thread as the panel.
+  if (event.type === "app_context_changed") return;
   if (event.type !== "app_home_opened" || event.tab !== "messages") return;
   const channel = event.channel ? String(event.channel) : "";
   if (!channel || isSilentEvent(env, { channel })) return;
-  const context = viewedContextOf(event.context);
-  if (context && event.user) await saveAssistantContext(env, { userId: event.user, context });
   await setAssistantPrompts(env, channel, null);
   if (!assistantGreetingOf(env) || !env?.PRIVROOM_STATE) return;
   const mark = assistantGreetedKey(channel);
