@@ -33,14 +33,26 @@ Before a substantive reply, read recent Slack history (docs/MESSAGE_LOG.md): con
 
 ## Threading
 
-Use the webhook `reply` object when it is present.
-- reply.thread_ts null: chat.postMessage with channel only (a normal DM or group-DM message).
-- reply.thread_ts set and reply.reply_broadcast false: thread_ts, no broadcast (a DM that was already in a thread).
-- reply.thread_ts set and reply.reply_broadcast true: thread_ts and reply_broadcast true (a channel).
+`reply` is the relay's hint for messages the relay posts. It is not an order to leave a 1:1 ask at the top of the DM. For a top-level 1:1 the hint is still thread_ts null and reply_broadcast false.
 
-If `reply` is missing, apply the same rule yourself: plain messages in DMs and group DMs unless slack.thread_ts is set and different from slack.ts; threads plus reply_broadcast in channels.
+1:1 DMs and the agent panel (slack.channel_type im) — this routine's policy. Pick thread_ts in this order:
+- reply.thread_ts, when it is set
+- else slack.thread_ts, when it is set and different from slack.ts
+- else slack.ts
 
-File uploads cannot set reply_broadcast. Upload into the thread, then post a separate short message with reply_broadcast when the rule says the channel should see it.
+That starts a topic thread for every top-level ask. Ordinary replies and progress stay in that thread and omit reply_broadcast.
+
+The only 1:1 broadcast is an explicit opt-in: the delayed final completion of a long job. Post that final message on the same topic thread_ts with reply_broadcast true so it can also show in the main DM. Do not broadcast progress.
+
+Group DMs (mpim) are unchanged: channel only, unless slack.thread_ts is set and different from slack.ts. Never set reply_broadcast.
+
+Channels: the relay may set reply.reply_broadcast true on a channel event. Do not follow that blindly.
+- First answer to a human ask that @mentions exactly one bot: thread_ts is the parent, or slack.ts when this message started the thread, and reply_broadcast true.
+- An ask that @mentions more than one bot: thread only. Omit reply_broadcast.
+- A follow-up (slack.thread_ts set and different from slack.ts): thread only, even if it mentions one bot again.
+- Exception: kind "privroom_synthesize". That combined reply may set reply_broadcast true. It is not a 1:1 topic. Do not use the 1:1 precedence for it.
+
+File uploads cannot set reply_broadcast. Upload into the topic thread, then post a separate short message with reply_broadcast only when the rule above says that text should also show outside the thread.
 
 ## Voice
 
@@ -54,7 +66,7 @@ When a spoken reply is appropriate, write the reply text to a temp file and run:
 
   python3 voice/speak_reply.py --text-file <path> --channel <slack.channel> --topic "<what the clip was about>"
 
-Pass --thread-ts only when reply.thread_ts is set. Pass --broadcast only for a channel (reply.reply_broadcast true). Voice, rate, pitch, comment, and title are flags on that script (voice/README.md). Needs files:read and files:write.
+Pass --thread-ts from the same 1:1 precedence (reply.thread_ts, then slack.thread_ts, then slack.ts) so a spoken reply lands in the topic. For a group DM, pass --thread-ts only when the message is already in a thread. Pass --broadcast only for the first answer to a single-bot channel ask, a privroom_synthesize reply, or that opt-in delayed 1:1 final. Ordinary 1:1 voice, multi-bot asks, and follow-ups stay in the thread. Voice, rate, pitch, comment, and title are flags on that script (voice/README.md). Needs files:read and files:write.
 
 ## Work status
 

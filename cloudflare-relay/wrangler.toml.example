@@ -102,4 +102,5 @@ PRIVROOM_DELAY_SECONDS = "300"
 
 # Secrets (set with `npx wrangler secret put NAME`, never in this file):
 #   SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, GROK_WEBHOOK_URL, GROK_WEBHOOK_SECRET,
-#   HONCHO_API_KEY   (needed when HONCHO_INGEST or HONCHO_READ is "1")
+#   HONCHO_API_KEY   (only when HONCHO_INGEST, HONCHO_READ, or SILENT_RECORD is on;
+#                     omit it while all three are off. Record-only does not use the other two.)
