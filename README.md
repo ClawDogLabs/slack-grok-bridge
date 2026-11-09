@@ -148,11 +148,16 @@ Every top-level ask therefore starts a topic thread rooted at that message. Late
 
 **Group DMs** (`mpim`) stay as they are. Post at the top level unless `slack.thread_ts` is set and different from `slack.ts`. Do not set `reply_broadcast`.
 
-**Channels** stay as they are, including a private channel the relay already treats as a channel. `thread_ts` is the parent, or `slack.ts` when this message started the thread, and `reply_broadcast: true` so that one bot's reply is also visible in the channel. A private-room synthesize wake is not a 1:1 topic. Do not apply the 1:1 precedence to it.
+**Channels** are routine policy. The relay still sets `reply.reply_broadcast` true on channel events, including follow-ups. Do not broadcast every reply that hint marks.
+
+- First answer to a human ask that @mentions exactly one bot: `thread_ts` is the parent, or `slack.ts` when this message started the thread, and `reply_broadcast: true`.
+- An ask that @mentions more than one bot: stay in the thread. Omit `reply_broadcast`.
+- A follow-up (`slack.thread_ts` set and different from `slack.ts`), including a later single-bot mention in that thread: stay in the thread.
+- Exception: a wake with `kind: "privroom_synthesize"`. That combined reply may set `reply_broadcast: true` even though the original ask named more than one bot. It is not a 1:1 topic, so do not apply the 1:1 precedence to it.
 
 `app_mention` often has no `channel_type`. The bridge calls `conversations.info` to tell a group DM from a channel. That needs the matching read scope (`channels:read`, `groups:read`, `im:read`, or `mpim:read`). If the lookup fails, the mention is treated as a channel.
 
-File uploads cannot set `reply_broadcast`. Upload into the thread, then post a separate short message with `reply_broadcast` when a channel should see it, or for that opt-in 1:1 final note. See [`voice/README.md`](voice/README.md).
+File uploads cannot set `reply_broadcast`. Upload into the thread, then post a separate short message with `reply_broadcast` only for that first single-bot channel answer, the private-room synthesis reply, or the opt-in 1:1 final note. See [`voice/README.md`](voice/README.md).
 
 Invite the bot into channels with `/invite @YourBotDisplayName`.
 
@@ -172,7 +177,7 @@ Phase A writes public-channel Slack messages to [Honcho](https://honcho.dev) aft
 
 The HTTP relay (Cloudflare Worker and `node-http-relay`, the same module) has a separate switch, `HONCHO_READ`, default off. When it is on, the wake handlers fetch that channel's session context and attach `payload.honcho` before the webhook. A failed or slow read still wakes (`honcho.ok === false`). Socket Mode stays write-only.
 
-Honcho is entirely optional. `HONCHO_INGEST` and `HONCHO_READ` both default off (`0` / unset / `false`). Leave them off and do not set `HONCHO_API_KEY` until you turn one of them on. The key is a secret (wrangler secret or `.env`, never committed) and is used only while ingest or read is enabled. `HONCHO_WORKSPACE_ID` defaults to `slack-workspace`.
+Honcho is optional and off by default on every path. `HONCHO_INGEST` (public ingest), `HONCHO_READ` (wake context), and `SILENT_RECORD` (isolated record-only capture) each default off. Record-only capture does not consult the other two switches: with `SILENT_RECORD` on, the Worker writes Honcho even when ingest and read are off, and an explicit record search reads that store the same way. A record-only backfill `--write` does too. Set `HONCHO_API_KEY` only when you enable one of those features, including record-only capture. With all three off, do not set the key. It is a secret (wrangler secret or `.env`, never committed). `HONCHO_WORKSPACE_ID` defaults to `slack-workspace`.
 
 Scope is public channels (`channel_type` `channel`). DMs (`im`), group DMs (`mpim`), and private channels (`group`) are dropped. A channel id that starts with `C` is not enough: group DMs can use those ids too. When `channel_type` is missing, `HONCHO_CHANNEL_IDS` (comma-separated public channel ids) is the allowlist. Otherwise a working `conversations.info` lookup is used. If that call cannot classify (`missing_scope` until `channels:read` is granted), the row is skipped. The same personal-term hold as `looksPersonal()` / the owner share policy drops family, schedule, address, phone, and email text. Tokens, key URLs, street addresses, and financial account numbers are dropped too. Empty and bot-noise subtypes are skipped. The bot's own public-channel replies are kept. A log label listed in `BOT_NAME` is stored under `OWN_USER_ID`, never as that label.
 

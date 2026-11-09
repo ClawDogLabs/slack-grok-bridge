@@ -69,7 +69,7 @@ The filename is a slug of the title plus `.mp3`.
 
 `files.getUploadURLExternal` + `files.completeUploadExternal` share a file into a channel and, if you pass it, a thread. They have no `reply_broadcast` parameter, so a thread upload stays in the thread.
 
-When the [threading rule](../README.md#threading) says a channel reply should also show in the channel, pass `--broadcast`. The script uploads the audio (with `--thread-ts` when there is one) and then posts a **separate** `chat.postMessage` in that thread with `reply_broadcast: true`. The note is the comment, or `Voice reply: <title>`, unless you set `--broadcast-text`. It does not paste the whole script into the channel.
+When the [threading rule](../README.md#threading) says this channel reply should also show in the channel, pass `--broadcast`. That is the first answer to a human ask that @mentions exactly one bot, or a private-room synthesis reply. Multi-bot asks and follow-ups do not. The script uploads the audio (with `--thread-ts` when there is one) and then posts a **separate** `chat.postMessage` in that thread with `reply_broadcast: true`. The note is the comment, or `Voice reply: <title>`, unless you set `--broadcast-text`. It does not paste the whole script into the channel.
 
 For a 1:1, pass `--thread-ts` so the audio is in the topic, and leave `--broadcast` off. The upload API has no `reply_broadcast` parameter. The script's extra note is a separate `chat.postMessage`, and it skips that note when there is no `--thread-ts`. Pass `--broadcast` on a 1:1 only for an opt-in delayed final completion, not for ordinary progress. Group DMs do not use `--broadcast`.
 
@@ -78,4 +78,4 @@ For a 1:1, pass `--thread-ts` so the audio is in the topic, and leave `--broadca
 1. If the webhook `slack.files` entry is audio (`mimetype` starts with `audio/`, or a voice clip), run `transcribe.py --file-id <id>` and treat the stdout as the user's words.
 2. Log the file id and mimetype with the rest of the message. See [../docs/MESSAGE_LOG.md](../docs/MESSAGE_LOG.md). Do not log `url_private` or the bot token.
 3. If a spoken reply is appropriate, write the reply text to a temp file and run `speak_reply.py` with `--topic` set from what the clip was about, `--channel` from the event, and `--thread-ts` from the 1:1 precedence in the [threading rule](../README.md#threading) (or, in a group DM, only when the message is already in a thread).
-4. For a channel, add `--broadcast` so the channel sees a one-line note. The audio itself is the thread reply. Do not add `--broadcast` for an ordinary 1:1.
+4. For the first answer to a single-bot channel ask, or a private-room synthesis reply, add `--broadcast` so the channel sees a one-line note. The audio itself is the thread reply. Do not add `--broadcast` for a multi-bot ask, a follow-up, or an ordinary 1:1.

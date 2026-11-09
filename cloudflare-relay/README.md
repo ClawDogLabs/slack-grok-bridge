@@ -40,9 +40,12 @@ Same routing and headers as the bridge. The webhook body adds a `reply` object; 
 - **Threading hint.** Messages this Worker posts use that placement, and the webhook
   copies it to `reply: { thread_ts, reply_broadcast }`. For a top-level 1:1 the hint is
   still `thread_ts: null` and `reply_broadcast: false`. Group DMs stay top-level unless
-  the message is already in a thread. Channels get a thread reply with `reply_broadcast`.
-  The routine's 1:1 and agent-panel policy is separate: it picks `reply.thread_ts`, then
-  `slack.thread_ts`, then `slack.ts`, so a top-level ask starts a topic thread. See the
+  the message is already in a thread. Channel events get `reply_broadcast: true` on the
+  hint, including follow-ups. The routine broadcasts only the first answer to a human
+  ask that @mentions exactly one bot; multi-bot asks and follow-ups stay in the thread.
+  A `kind: "privroom_synthesize"` reply may still broadcast. The 1:1 and agent-panel
+  policy is separate: the routine picks `reply.thread_ts`, then `slack.thread_ts`, then
+  `slack.ts`, so a top-level ask starts a topic thread. See the
   top-level README. `app_mention` has no `channel_type`; the Worker calls `conversations.info`
   when it can (`channels:read`, `groups:read`, `im:read`, or `mpim:read`). If that call
   fails, the mention is treated as a channel.
@@ -58,7 +61,7 @@ Webhook request (identical to the bridge):
 `POST GROK_WEBHOOK_URL` with `Authorization: Bearer <GROK_WEBHOOK_SECRET>` and
 `X-Automation-Key: <GROK_WEBHOOK_SECRET>`, body
 `{ source, kind, slack: { type, user, user_name, user_real_name, user_display_name, channel, channel_type, ts, thread_ts, text, subtype, files }, hold_ack, reply }`.
-`reply` is `{ thread_ts, reply_broadcast }`. `thread_ts` is null on a top-level 1:1 hint. The routine still starts a topic thread from `slack.ts` in that case. Group DMs and channels keep the hint as posted.
+`reply` is `{ thread_ts, reply_broadcast }`. `thread_ts` is null on a top-level 1:1 hint. The routine still starts a topic thread from `slack.ts` in that case. Group DMs keep the hint as posted. On a channel, `reply_broadcast: true` is only the hint; the routine broadcasts the first single-bot answer and a private-room synthesis reply, not every follow-up.
 
 ### More config
 
@@ -195,7 +198,7 @@ Subscribe to bot events `assistant_thread_started`, `assistant_thread_context_ch
 
 ## Private record (off by default)
 
-`SILENT_RECORD` defaults to `"0"`. Leave it off until the mute is what the live Worker is running, `message.groups` is subscribed, the bot token has `groups:history`, and you have watched one new message log `honcho record ok` without a Slack reaction. Mentions already arrive as `app_mention`. Ordinary private-channel messages do not arrive until those two Slack settings are verified. This repo does not change the Slack app.
+`SILENT_RECORD` defaults to `"0"`. It does not read `HONCHO_INGEST` or `HONCHO_READ`. Leave it off until the mute is what the live Worker is running, `message.groups` is subscribed, the bot token has `groups:history`, and you have watched one new message log `honcho record ok` without a Slack reaction. Turning it on calls Honcho, so set `HONCHO_API_KEY` first. Mentions already arrive as `app_mention`. Ordinary private-channel messages do not arrive until those two Slack settings are verified. This repo does not change the Slack app.
 
 When the switch is on, a muted channel is written to the **same** Honcho workspace (no second workspace) as session `record-<channelId>` and peer `rec-<channelId>-<slackUserId>`. The Slack user id is metadata for the owner view, not the Honcho peer id. The public session `channel-<id>` is not used. Setup sends session configuration `reasoning.enabled`, `summary.enabled`, `dream.enabled` false and `peer_card.create` / `use` false, session-peer `observe_me` and `observe_others` false, and message `reasoning.enabled` false. Honcho v3.6 documents message config as the highest layer and `observe_me` defaulting to true; the deriver skips a representation only when the effective flag is false, and summaries are a separate queue, which is why summary is disabled explicitly. The session PUT and the peer-config PUT must succeed or the message is not posted, and the code does not fall back to public ingest. Wake reads (`HONCHO_READ`) return `silent` and do not fetch `record-<id>`.
 
@@ -238,7 +241,7 @@ Deploy this the same way as the mute: cherry-pick onto the source that matches t
 
 `HONCHO_READ` is independent of `HONCHO_INGEST` and defaults to `"0"`. When it is `"1"`, `processInbound` and `forwardWatched` GET the per-channel session (`channel-<id>`) and attach the result as `payload.honcho` before `wakeGrok`. `HONCHO_READ_TIMEOUT_MS` defaults to `1500` and is capped at `15000`. A missing key, HTTP error, or timeout still wakes Grok with `honcho.ok === false`. The read runs in `ctx.waitUntil`, so the Slack `200` is not delayed. Socket Mode stays write-only; this read hook is on the Worker module, which `node-http-relay` imports.
 
-Honcho stays off unless you opt in. With `HONCHO_INGEST` and `HONCHO_READ` both at `"0"`, do not set `HONCHO_API_KEY`. The Worker does not call Honcho. Set the key with `npx wrangler secret put`, not in `wrangler.toml`, only when you turn ingest or read on.
+Honcho stays off unless you opt in. `HONCHO_INGEST`, `HONCHO_READ`, and `SILENT_RECORD` each default off. Record-only capture does not check the other two: `ingestSilentIfEnabled` runs when `SILENT_RECORD` is on, and `sendRecord` posts to Honcho with `HONCHO_API_KEY`. An allowed record search calls `queryRecordSession`, which uses that same key and does not check ingest or read. With all three switches off, do not set the key; nothing calls Honcho. Set the key with `npx wrangler secret put`, not in `wrangler.toml`, only when you enable ingest, wake reads, or record-only capture.
 
 `HONCHO_CHANNEL_IDS` is optional. Set it to comma-separated public channel ids. The current bot token gets `missing_scope` from `conversations.info` (no `channels:read`). Events that already include `channel_type: channel` still ingest. `app_mention` often has no type: those are ingested only when the channel id is in `HONCHO_CHANNEL_IDS`, or when `conversations.info` succeeds and says the channel is public. A failed lookup does not treat a `C` id as public, so a group-DM mention is not written. Wake routing is unchanged.
 

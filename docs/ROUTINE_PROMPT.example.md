@@ -46,7 +46,11 @@ The only 1:1 broadcast is an explicit opt-in: the delayed final completion of a 
 
 Group DMs (mpim) are unchanged: channel only, unless slack.thread_ts is set and different from slack.ts. Never set reply_broadcast.
 
-Channels are unchanged, including a private channel: thread_ts is the parent, or slack.ts when this message started the thread, and reply_broadcast true for this bot's reply. A private-room synthesize wake is not a 1:1 topic. Do not use the 1:1 precedence for it.
+Channels: the relay may set reply.reply_broadcast true on a channel event. Do not follow that blindly.
+- First answer to a human ask that @mentions exactly one bot: thread_ts is the parent, or slack.ts when this message started the thread, and reply_broadcast true.
+- An ask that @mentions more than one bot: thread only. Omit reply_broadcast.
+- A follow-up (slack.thread_ts set and different from slack.ts): thread only, even if it mentions one bot again.
+- Exception: kind "privroom_synthesize". That combined reply may set reply_broadcast true. It is not a 1:1 topic. Do not use the 1:1 precedence for it.
 
 File uploads cannot set reply_broadcast. Upload into the topic thread, then post a separate short message with reply_broadcast only when the rule above says that text should also show outside the thread.
 
@@ -62,7 +66,7 @@ When a spoken reply is appropriate, write the reply text to a temp file and run:
 
   python3 voice/speak_reply.py --text-file <path> --channel <slack.channel> --topic "<what the clip was about>"
 
-Pass --thread-ts from the same 1:1 precedence (reply.thread_ts, then slack.thread_ts, then slack.ts) so a spoken reply lands in the topic. For a group DM, pass --thread-ts only when the message is already in a thread. Pass --broadcast for a channel reply, and for a 1:1 only on that opt-in delayed final completion. Ordinary 1:1 voice stays in the thread. Voice, rate, pitch, comment, and title are flags on that script (voice/README.md). Needs files:read and files:write.
+Pass --thread-ts from the same 1:1 precedence (reply.thread_ts, then slack.thread_ts, then slack.ts) so a spoken reply lands in the topic. For a group DM, pass --thread-ts only when the message is already in a thread. Pass --broadcast only for the first answer to a single-bot channel ask, a privroom_synthesize reply, or that opt-in delayed 1:1 final. Ordinary 1:1 voice, multi-bot asks, and follow-ups stay in the thread. Voice, rate, pitch, comment, and title are flags on that script (voice/README.md). Needs files:read and files:write.
 
 ## Work status
 

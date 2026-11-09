@@ -271,7 +271,7 @@ Use e.g. **`:21` / `:51`** past the hour (twice-hourly weekday daytime). `ensure
 - `reply` is where the relay posts its own messages. For a 1:1 answer, this routine picks `thread_ts` itself: `reply.thread_ts`, then `slack.thread_ts` when it differs from `slack.ts`, then `slack.ts`. That starts a topic thread for a top-level ask. Later replies and progress stay in the thread and omit `reply_broadcast`.
 - **Opt-in only:** the delayed final completion of a long job may set `reply_broadcast: true` on that same topic `thread_ts`.
 - **Group DMs:** `channel` only, unless the message is already in a thread. Do not set `reply_broadcast`.
-- **Channels:** `thread_ts` (inbound `thread_ts`, or the message `ts`) and **`reply_broadcast: true`** for this bot's reply. That flag is per message, **not** a YAML/manifest setting. Do not apply the 1:1 topic rule to a private-room synthesize wake.
+- **Channels:** the relay hint often sets `reply_broadcast` true. This routine broadcasts only the first answer to a human ask that @mentions exactly one bot. Multi-bot asks and follow-ups stay in the thread. A `kind: "privroom_synthesize"` reply may still broadcast. That flag is per message, **not** a YAML/manifest setting. Do not apply the 1:1 topic rule to that synthesize wake.
 
 ```js
 // 1:1 topic reply. Omit reply_broadcast except on an opt-in delayed final.
@@ -281,7 +281,9 @@ await client.chat.postMessage({
   text: replyText,
 });
 
-// Channel reply. One bot, also visible in the channel.
+// First answer in a channel when the ask @mentioned exactly one bot.
+// Omit reply_broadcast for a multi-bot ask or any follow-up.
+// A privroom_synthesize reply may still set it.
 await client.chat.postMessage({
   channel,
   thread_ts: threadTs,
@@ -304,7 +306,7 @@ await client.chat.postMessage({
 | Own webhook routine + `GROK_WEBHOOK_*` | URL + sender key in `.env`; Bearer + X-Automation-Key |
 | `npm install` + `./start.sh` | `bridge.log` shows Socket Mode |
 | Keep-alive | Weekday daytime `ensure-running` |
-| Invite + smoke `@mention` | Bot reacts and wakes. A channel reply uses `thread_ts` + `reply_broadcast`. A 1:1 reply uses the topic `thread_ts` and stays in the thread. |
+| Invite + smoke `@mention` | Bot reacts and wakes. The first channel answer to a single-bot ask uses `thread_ts` + `reply_broadcast`. A 1:1 reply uses the topic `thread_ts` and stays in the thread. |
 
 ---
 
