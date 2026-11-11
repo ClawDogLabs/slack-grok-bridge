@@ -87,7 +87,7 @@ Optional: set webhook payload `source` in `index.js` to identify your bridge (de
 
 **Before creating the app**, have the bot confirm the display name with you, then fill:
 
-- `display_information.name` / `description` / `long_description`
+- `display_information.name` / `description` / `long_description` (Slack requires `long_description` to be at least 175 characters)
 - `display_information.background_color` — **does not need to match anyone else's**
 - `features.bot_user.display_name` — **ASCII only** (Slack rejects accents); must match To: / @picker
 
@@ -97,7 +97,7 @@ Optional: set webhook payload `source` in `index.js` to identify your bridge (de
 display_information:
   name: YOUR_BOT_NAME
   description: Grok Bot bridge
-  long_description: Socket Mode Slack bridge that wakes this person's Grok Bot on @mentions and DMs, then posts channel replies in threads and DM replies as normal messages.
+  long_description: Slack bridge for YOUR_BOT_NAME, a personal Grok Bot. It wakes the bot on @mentions and DMs over Socket Mode or an HTTP relay, then posts channel replies in threads and DM replies as normal messages. Private DMs stay limited to the bot's owner.
   background_color: "#1a1a2e"
 features:
   bot_user:
