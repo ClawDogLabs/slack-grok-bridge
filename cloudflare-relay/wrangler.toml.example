@@ -99,6 +99,12 @@ STICKY_THREADS = "1"
 PRIVROOM_SYNTHESIZE = "1"
 # PRIVROOM_BOTS = '[{"name":"BotA","userId":"UPLACEHOLDER2","botId":"BPLACEHOLDER1"}]'
 PRIVROOM_DELAY_SECONDS = "300"
+# Slash commands that post a private-room question. Comma-separated.
+# /privroom is always accepted. Blank or all-invalid values add nothing.
+# A token must be /name using letters, digits, underscore, or hyphen (1-32).
+# PRIVROOM_COMMANDS = "/sample-ask,/sample-ask-2"
+# Optional tag string. Unset uses <@userId> from PRIVROOM_BOTS.
+# PRIVROOM_MENTION_TAGS = "<@UPLACEHOLDER2> <@UPLACEHOLDER3>"
 
 # Secrets (set with `npx wrangler secret put NAME`, never in this file):
 #   SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, GROK_WEBHOOK_URL, GROK_WEBHOOK_SECRET,
