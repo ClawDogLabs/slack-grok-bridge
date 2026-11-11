@@ -134,6 +134,10 @@ That text follows the relay's own placement, not the routine's topic rule below.
 
 Other knobs: `THINKING_TIMEOUT_MS` (default 45000 safety clear), `BRIDGE_SOURCE` (payload `source` field). The HTTP relays use the same acknowledgement. A later `chat.postMessage` is the real answer and needs `chat:write`.
 
+## Tag-only follow-ups (HTTP relay)
+
+The HTTP relay (`cloudflare-relay`, and `node-http-relay` which runs the same module) merges a tag-only @mention with the same person's previous message when that message is within `PRIOR_WINDOW_SECONDS` (60 seconds). The lookup uses `conversations.history` or `conversations.replies` and needs `channels:history`, `groups:history`, `im:history`, and `mpim:history` for the conversation type. Without those scopes it logs `tag-only prior lookup skipped` and wakes on the mention alone. Any Slack API error or exception does the same (fail-open). A mention that already has text does no lookup. `slack.ts` stays the mention timestamp. Socket Mode does not do this merge. Details are in [`cloudflare-relay/README.md`](cloudflare-relay/README.md#tag-only-follow-ups).
+
 ## Threading
 
 The Socket Mode bridge and both HTTP relays apply the placement below to messages **they** post (a hold-ack, a welcome, a record-search reply). They copy that decision onto the webhook as `reply`. Follow `routing` for the answer. `reply` can still say `reply_broadcast: true` on a channel follow-up; `routing.reply_broadcast` is the rule.
