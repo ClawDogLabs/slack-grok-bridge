@@ -18,6 +18,10 @@
  * and forwardWatched await one session context and attach payload.honcho before
  * wakeGrok. A slow or failed read still wakes (honcho.ok === false). See src/honcho.js.
  *
+ * Tag-only follow-ups: a mention that is only @mentions and whitespace can pull
+ * in the same person's previous message from the last PRIOR_WINDOW_SECONDS (60).
+ * The lookup is read-only and fail-open. See findPriorForTagOnly.
+ *
  * SILENT_CHANNEL_IDS (comma-separated) is a mute. Those channels get HTTP 200
  * and nothing else: no reaction, thinking status, hold-ack, welcome, wake, or
  * Honcho write. The check runs before ensureSelf and before route/handle.
@@ -411,6 +415,66 @@ async function postHoldAck(env, c, channel, fields, text) {
   await slackApi(env, "chat.postMessage", postMessageArgs(channel, body, placement)).catch(() => {});
 }
 
+// ---------------------------------------------------------------- tag-only follow-ups
+// Some people post the question, then tag the bot in a separate message a few
+// seconds later. The tag-only message carries no question, so pull in the same
+// person's message just before it. Read-only, fail-open: any API failure keeps
+// the original text.
+export const PRIOR_WINDOW_SECONDS = 60;
+const PRIOR_OK_SUBTYPES = new Set(["file_share", "thread_broadcast"]);
+const MENTION_TOKEN_RE = /<(?:@[UW][A-Z0-9]+|!subteam\^[A-Z0-9]+)(?:\|[^>]*)?>/g;
+
+/** True when the text is only mentions and whitespace, and tags this bot (when known). */
+export function isMentionOnly(text, ownUserId) {
+  const t = String(text || "");
+  if (ownUserId && !t.includes(`<@${ownUserId}>`)) return false;
+  if (!ownUserId && !/<@[UW][A-Z0-9]+/.test(t)) return false;
+  return t.replace(MENTION_TOKEN_RE, "").trim() === "";
+}
+
+/** Whether message m qualifies as the prior half of e's tag-only follow-up. */
+export function priorEligible(m, e, windowSec = PRIOR_WINDOW_SECONDS) {
+  if (!m || typeof m !== "object" || !e) return false;
+  if (m.bot_id || (m.app_id && !m.user)) return false;
+  if (m.subtype && !PRIOR_OK_SUBTYPES.has(m.subtype)) return false;
+  if (!e.user || m.user !== e.user) return false;
+  const dt = Number(e.ts) - Number(m.ts);
+  if (!Number.isFinite(dt) || dt <= 0 || dt > windowSec) return false;
+  const text = String(m.text || "").trim();
+  if (!text || isMentionOnly(text, null)) return false;
+  const eThread = e.thread_ts && e.thread_ts !== e.ts ? e.thread_ts : null;
+  if (eThread) return m.ts === eThread || m.thread_ts === eThread;
+  return !m.thread_ts || m.thread_ts === m.ts || m.subtype === "thread_broadcast";
+}
+
+/** Returns { text, ts } of the same user's prior message, or null. Never throws. */
+export async function findPriorForTagOnly(env, c, e) {
+  try {
+    if (!e || !e.channel || !e.ts || !e.user || !env.SLACK_BOT_TOKEN) return null;
+    if (!isMentionOnly(e.text, c?.ownUserId || null)) return null;
+    const eThread = e.thread_ts && e.thread_ts !== e.ts ? e.thread_ts : null;
+    const res = eThread
+      ? await slackApi(env, "conversations.replies", { channel: e.channel, ts: eThread, latest: e.ts, inclusive: "false", limit: "10" }, { get: true, quiet: true })
+      : await slackApi(env, "conversations.history", { channel: e.channel, latest: e.ts, inclusive: "false", limit: "5" }, { get: true, quiet: true });
+    if (!res?.ok || !Array.isArray(res.messages)) {
+      log("tag-only prior lookup skipped", res?.error || "no messages", e.channel, e.ts);
+      return null;
+    }
+    const before = res.messages.filter((m) => m && m.ts && Number(m.ts) < Number(e.ts));
+    if (!before.length) return null;
+    const newest = before.reduce((a, b) => (Number(b.ts) > Number(a.ts) ? b : a));
+    if (!priorEligible(newest, e)) return null;
+    return { text: String(newest.text || "").trim(), ts: newest.ts };
+  } catch (err) {
+    log("tag-only prior lookup error", err?.message || err);
+    return null;
+  }
+}
+
+export function mergePriorText(text, prior) {
+  return `[prior message from same user]: ${prior.text}\n${String(text || "").trim()}`;
+}
+
 // ---------------------------------------------------------------- handlers (run in waitUntil)
 
 /** Session context for the wake payload. Fail-open: never throws. */
@@ -433,7 +497,16 @@ async function processInbound(env, c, kind, e, sayOnFail, extra = null) {
   await addAckReaction(env, c, channel, e.ts);
   await setThinking(env, c, channel, threadTs);
   try {
+    const prior = await findPriorForTagOnly(env, c, e);
     const slack = await summarizeEvent(env, e);
+    if (prior) {
+      slack.original_text = e.text;
+      slack.prior_text = prior.text;
+      slack.prior_ts = prior.ts;
+      slack.text = mergePriorText(e.text, prior);
+      e = { ...e, text: slack.text };
+      log("tag-only merged prior", channel, e.ts, prior.ts);
+    }
     const payload = {
       source: c.source,
       kind,

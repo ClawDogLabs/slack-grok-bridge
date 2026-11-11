@@ -64,6 +64,22 @@ Webhook request (identical to the bridge):
 `{ source, kind, slack, hold_ack, reply, routing }`.
 `reply` is the relay's own placement hint. `routing` is `{ surface, panel, provenance, reply_thread_ts, reply_broadcast, context, viewed, viewed_source }`. Post the answer from `routing`. On a channel, `reply.reply_broadcast` can still be true for a follow-up; `routing.reply_broadcast` is true only for the first single-bot answer. A private-room synthesis wake is separate and may still broadcast.
 
+## Tag-only follow-ups
+
+People sometimes post a question, then a few seconds later post a second message that only @mentions the bot. That second message has nothing to answer. When `processInbound` handles a mention whose text is only mentions and whitespace, and the mention tags this bot, the Worker looks up the newest message just before it in the same conversation. A top-level mention uses `conversations.history`. A mention inside a thread (`thread_ts` different from `ts`) uses `conversations.replies`. `node-http-relay` imports this module, so it does the same lookup. Socket Mode does not.
+
+The prior message is merged only when all of these are true:
+
+- It is from the same human user (not a bot message, and not `app_id` with no user).
+- It is within `PRIOR_WINDOW_SECONDS` (60 seconds). Older messages stay out.
+- Its subtype is absent, or is `file_share` or `thread_broadcast`. Other subtypes are ignored.
+- It has real text, not another mention-only line.
+- It is in the same thread scope: the thread parent or a reply in that thread when the mention is in a thread; otherwise a top-level message, or a `thread_broadcast`.
+
+On a merge the wake payload adds `slack.original_text` (the raw mention), `slack.prior_text`, and `slack.prior_ts`. `slack.text` becomes `[prior message from same user]: <prior>` plus a newline plus the mention text trimmed. `slack.ts` stays the mention timestamp, so replies still thread under the mention. Later steps in that wake, including the hold-ack personal check and an optional Honcho read, see the merged text.
+
+A mention that already has text does no lookup at all. The lookup is read-only and fail-open: any Slack API error, missing scope, or exception keeps the original text and the original wake. The history scopes are `channels:history`, `groups:history`, `im:history`, and `mpim:history`. Without the scope for that conversation the Worker logs `tag-only prior lookup skipped` and behaves as before. The sample manifest already includes the first three. Group DMs need `mpim:history`, which the manifest does not include; add it and reinstall only if tag-only follow-ups in group DMs should merge.
+
 ### More config
 
 | Var | Effect |
