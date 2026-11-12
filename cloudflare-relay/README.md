@@ -91,7 +91,9 @@ A mention that already has text does no lookup at all. The lookup is read-only a
 | `HOLD_ACK_SKIP_REGEX` | Asks matching this regex get no text hold-ack (e.g. off-topic questions your routine will politely decline). |
 | `WELCOME_CHANNEL_IDS`, `WELCOME_TEXT`, `ASK_CHANNEL_ID` | New human joiners get a :wave: reaction and `WELCOME_TEXT` (`{user}`, `{ask_channel}` placeholders). Needs `reactions:write`. |
 | `ALLOW_BOT_IDS`, `ALLOW_BOT_USER_IDS` | Other bots allowed to @mention this bot (`B…` and/or bot user `U…`, comma-separated). Empty ignores every bot mention. This bot's own id is always ignored. |
-| `BOT_REPLY_CAP` | After an allow-listed bot has posted more than this many messages in a thread (default `3`), later @mentions from that bot in the thread are ignored. Humans are never capped. A top-level bot message (no `thread_ts`) is always allowed. The count is that bot's messages in `conversations.replies` (limit 200). If the call fails or the thread cannot be read, the relay ignores the bot mention (fail closed). `conversations.replies` needs a history scope for the conversation type. The manifest already includes `channels:history`, `groups:history`, and `im:history`, so public channels, private channels, and DMs need no new scope. Group DMs need `mpim:history`, which is not in the manifest; without it the relay fails closed for bot mentions in group-DM threads. Add that scope and reinstall only if the cap should count messages there. |
+| `BOT_REPLY_CAP` | After an allow-listed bot has posted more than this many messages in a thread (default `3`), later @mentions from that bot in the thread are ignored. Humans are never capped. A top-level bot message (no `thread_ts`) is always allowed. The count is that bot's messages in `conversations.replies` (limit 200). If the call fails or the thread cannot be read, the relay ignores the bot mention (fail closed). `conversations.replies` needs a history scope for the conversation type. The manifest already includes `channels:history`, `groups:history`, and `im:history`, so public channels, private channels, and DMs need no new scope. Group DMs need `mpim:history`, which is not in the manifest; without it the relay fails closed for bot mentions in group-DM threads. Add that scope and reinstall only if the cap should count messages there. The same number caps bot-authored `FORWARD_WAKE` posts per thread. |
+| `FORWARD_WAKE` | Optional. Off when unset or empty. Registers bot user ids that only wake on a human tag, and POSTs `kind: "forwarded_mention"` to each target's own webhook when a message tags it. See [Forward wake](#forward-wake-off-by-default). Socket Mode does not forward. |
+| `HONCHO_BOT_INGEST_IDS` | Optional. Comma-separated bot user ids (`U...`) and/or bot ids (`B...`). Empty or unset skips other bots, same as before. See [Allowlisted bot replies](#allowlisted-bot-replies-off-by-default). |
 | `BOT_NAME`, `MPIM_REQUIRE_ADDRESS` | With `MPIM_REQUIRE_ADDRESS="true"`, group DMs only wake the bot when it's @mentioned, `BOT_NAME` appears, or the message is audio. |
 | `RETRY_POLICY` | See below. |
 
@@ -251,6 +253,67 @@ Dry-run prints `peer_id` values that start with `rec-` and `session_id` `record-
 
 Deploy this the same way as the mute: cherry-pick onto the source that matches the running Worker (`2b1c4525` is not in this repo). Do not `wrangler deploy` this git tree over that script.
 
+## Forward wake (off by default)
+
+Some bots only wake when a human tags them, so a tag written by another bot never reaches them. `FORWARD_WAKE` is optional. Leave it unset or empty and this relay does not forward anything: no extra POST, and the Slack ack is unchanged. Socket Mode does not forward.
+
+When a `message` event tags a registered bot user id, the Worker POSTs a small JSON body to that bot's own webhook. The POST runs in `ctx.waitUntil`, separate from this relay's wake. A failure is logged and does not block the wake. Log lines never include the webhook URL or the key.
+
+The var itself is config, not a secret. Keep real ids in untracked runtime config. Two forms:
+
+JSON (set `humans` to true only if human tags should also be forwarded; default is false):
+
+```toml
+# FORWARD_WAKE = '{"UPLACEHOLDER2":{"secret":"TARGET_WEBHOOK","bot_id":"BPLACEHOLDER2","humans":false}}'
+```
+
+Short form (no bot id, `humans` stays false). Several targets are comma-separated:
+
+```toml
+# FORWARD_WAKE = "UPLACEHOLDER2:TARGET_WEBHOOK,UPLACEHOLDER3:OTHER_WEBHOOK"
+```
+
+The user id must look like `U` plus uppercase letters and digits. `secret` is a prefix of uppercase letters, digits, and underscores, starting with a letter. A bad JSON value is ignored and logged as `forward-wake: bad FORWARD_WAKE json`. Junk ids and prefixes are dropped.
+
+Set the webhook with wrangler. Never put the URL or key in `wrangler.toml`:
+
+```bash
+printf '%s' "$TARGET_WEBHOOK_URL" | npx wrangler secret put TARGET_WEBHOOK_URL
+printf '%s' "$TARGET_WEBHOOK_KEY" | npx wrangler secret put TARGET_WEBHOOK_KEY
+```
+
+That is `<PREFIX>_URL` and `<PREFIX>_KEY` for the prefix named in `secret`. The POST sends `Authorization: Bearer <key>` and `X-Automation-Key: <key>`, with `Content-Type: application/json`. If either secret is missing, the forward is skipped and the log names the prefix, not the URL or the key.
+
+Payload shape (`source` is `BRIDGE_SOURCE`, default `slack-grok-bridge`). `slack` is the usual event summary plus `bot_id` and `author_is_bot`:
+
+```json
+{
+  "source": "slack-grok-bridge",
+  "kind": "forwarded_mention",
+  "forwarded_for": "UPLACEHOLDER2",
+  "slack": {
+    "channel": "CPLACEHOLDER1",
+    "ts": "2000.000100",
+    "thread_ts": "1999.000001",
+    "text": "<@UPLACEHOLDER2> did this wake you?",
+    "bot_id": "BPLACEHOLDER1",
+    "author_is_bot": true
+  },
+  "reply": { "channel": "CPLACEHOLDER1", "thread_ts": "1999.000001", "reply_broadcast": false }
+}
+```
+
+Rules:
+
+- Only bot-authored tags are forwarded unless that target sets `"humans": true`. A human tag is left for the target's own native wake.
+- The target's own messages are skipped, matched by user id or by `bot_id` when the target config includes one.
+- Edits are skipped. A subtype other than `bot_message`, `file_share`, `thread_broadcast`, or `slack_audio` is skipped. A message with no subtype can forward.
+- `app_mention` is not forwarded. The matching `message` event is the one that forwards, which avoids a double POST.
+- Muted channels (`SILENT_CHANNEL_IDS`) never forward.
+- Every `ts` is forwarded at most once per target. The dedupe key is stored in the `PRIVROOM_STATE` KV binding for 3 days.
+- Bot-authored forwards are capped per thread at `BOT_REPLY_CAP` (default 3). That counter is stored in `PRIVROOM_STATE` for 7 days. Another thread has its own counter. Human forwards, only when `humans` is true, are not capped.
+- If `PRIVROOM_STATE` is missing, the forward is skipped and logged. The relay does not POST without that dedupe store, so a missing binding cannot loop.
+
 ## Honcho ingest (off by default)
 
 `HONCHO_INGEST` in `[vars]` defaults to `"0"`. Public-channel writes run inside `ctx.waitUntil` after the Worker has already built the `200` response. `wakeGrok` does not call Honcho. Ingest itself does not read.
@@ -271,6 +334,27 @@ Honcho stays off unless you opt in. `HONCHO_INGEST`, `HONCHO_READ`, and `SILENT_
 4. `npx wrangler secret put HONCHO_API_KEY`, confirm `HONCHO_WORKSPACE_ID` (`slack-workspace` if unset), then set `HONCHO_INGEST = "1"` and deploy again.
 5. Watch `npx wrangler tail` for `honcho ok` / `honcho skip`. A DM must not produce a Honcho post.
 6. Rollback: set `HONCHO_INGEST` back to `"0"` (or delete the var) and deploy. Ingest becomes a no-op. Already stored Honcho messages are left as-is.
+
+### Allowlisted bot replies (off by default)
+
+`HONCHO_BOT_INGEST_IDS` is a comma-separated list of bot user ids (`U...`) and/or bot ids (`B...`). Unset or empty keeps the previous rule for other bots: they are skipped. Only this bot's own public replies are stored, with the same payload as before.
+
+```toml
+# HONCHO_BOT_INGEST_IDS = "UPLACEHOLDER2,BPLACEHOLDER2"
+```
+
+When the list is set, a reply from one of those bots in a channel that is already eligible for ingest is stored. Each bot is its own Honcho peer, created with metadata `{ "kind": "bot", "source": "slack" }`. The message metadata adds `author_kind` `bot` and, when Slack sent one, `bot_id`. This bot's own outbound messages get that same bot label once the list is non-empty. A `bot_message` with no user id uses the bot id as the peer id when that bot id is on the list.
+
+Bots that are not on the list are still skipped. DMs, group DMs, and private channels that are not opted into a private session still fail closed. Edits, deletes, and system subtypes are skipped. The personal-term and sensitive-text filters still apply.
+
+Backfill those bot replies from Slack channel history. The default is a dry run. `--write` posts. It reads `HONCHO_CHANNEL_IDS`, skips muted channels, and skips a `slack_ts` that is already stored on that channel's Honcho session. Own bot replies and `HONCHO_BOT_INGEST_IDS` are the only bot authors it keeps.
+
+```bash
+node --env-file=.env scripts/honcho-bot-backfill.mjs
+node --env-file=.env scripts/honcho-bot-backfill.mjs --write
+```
+
+Placeholders only in git: `UPLACEHOLDER1`, `BPLACEHOLDER1`, `CPLACEHOLDER1`. Real ids stay in untracked runtime config.
 
 ## Redeploy / rollback
 

@@ -14,8 +14,10 @@
  * not channel:id. One session keeps that room together for a later on-demand read.
  *
  * Peer id is the Slack user id (U... or W...). A log label is never used as a
- * peer id. Message content is "<author>: <text>" when a display
- * name or user id is available. slack_ts is stored on metadata.
+ * peer id. HONCHO_BOT_INGEST_IDS (optional, empty by default) also stores
+ * replies from those bots, each as its own peer. Message content is
+ * "<author>: <text>" when a display name or user id is available. slack_ts
+ * is stored on metadata.
  *
  * Channel scope: channel_type "channel" is public. A C id is not. Group DMs can
  * also use C ids. When type is missing, HONCHO_CHANNEL_IDS wins, then a working
@@ -341,6 +343,28 @@ function isOwnOutbound(event, opts) {
   return false;
 }
 
+/**
+ * Registry of other bots whose public replies are ingested (HONCHO_BOT_INGEST_IDS,
+ * comma-separated U... bot user ids and/or B... bot ids). Empty = only our own.
+ */
+export function botIngestSetOf(env) {
+  const raw = env?.HONCHO_BOT_INGEST_IDS;
+  if (raw instanceof Set) return raw;
+  return new Set(String(raw || "").split(",").map((x) => x.trim()).filter(Boolean));
+}
+
+function isBotAuthored(event) {
+  return !!event?.bot_id || event?.subtype === "bot_message";
+}
+
+function isAllowedIngestBot(event, opts) {
+  const ids = opts?.botIds;
+  if (!ids || !ids.size) return false;
+  if (event?.bot_id && ids.has(String(event.bot_id))) return true;
+  if (event?.user && ids.has(String(event.user))) return true;
+  return false;
+}
+
 function subtypeAllowed(event, own) {
   const st = event?.subtype || null;
   if (!st) return true;
@@ -360,8 +384,10 @@ export function decideIngest(event, opts = {}) {
   if (event.hidden) return { ok: false, reason: "hidden" };
 
   const own = isOwnOutbound(event, opts);
-  if (!own && (event.bot_id || event.subtype === "bot_message")) return { ok: false, reason: "bot" };
-  if (!subtypeAllowed(event, own)) return { ok: false, reason: "subtype" };
+  const bot = isBotAuthored(event);
+  const allowedBot = !own && bot && isAllowedIngestBot(event, opts);
+  if (!own && bot && !allowedBot) return { ok: false, reason: "bot" };
+  if (!subtypeAllowed(event, own || allowedBot)) return { ok: false, reason: "subtype" };
 
   const text = String(event.text || "").trim();
   if (!text) return { ok: false, reason: "empty" };
@@ -371,7 +397,7 @@ export function decideIngest(event, opts = {}) {
   const sensitive = sensitiveReason(text);
   if (sensitive) return { ok: false, reason: sensitive };
 
-  const peerId = String(event.user || "");
+  const peerId = String(event.user || (allowedBot ? event.bot_id : "") || "");
   if (!ID_RE.test(peerId)) return { ok: false, reason: "no-peer" };
   const channel = String(event.channel || "");
   if (!ID_RE.test(channel)) return { ok: false, reason: "bad-channel" };
@@ -388,6 +414,10 @@ export function decideIngest(event, opts = {}) {
     threadTs: event.thread_ts || null,
     subtype: event.subtype || null,
     own,
+    // Label our own replies only when the allowlist is non-empty, so an unset
+    // HONCHO_BOT_INGEST_IDS leaves existing Honcho payloads unchanged.
+    authorKind: allowedBot || (own && bot && opts?.botIds?.size) ? "bot" : null,
+    botId: bot && event.bot_id ? String(event.bot_id) : null,
   };
 }
 
@@ -424,6 +454,10 @@ export async function materialize(decision, opts = {}) {
   if (decision.threadTs) metadata.thread_ts = decision.threadTs;
   if (decision.subtype) metadata.subtype = decision.subtype;
   if (display) metadata.author_display = display;
+  if (decision.authorKind === "bot") {
+    metadata.author_kind = "bot";
+    if (decision.botId) metadata.bot_id = decision.botId;
+  }
   const createdAt = slackTsToIso(decision.ts);
   return {
     ...decision,
@@ -480,7 +514,9 @@ export async function sendIngest(env, prepared, opts = {}) {
     state.workspace = ws;
   }
   if (!state.peers.has(prepared.peerId)) {
-    await honchoPost(env, `/v3/workspaces/${encodeURIComponent(ws)}/peers`, { id: prepared.peerId }, fetchImpl);
+    const peerBody = { id: prepared.peerId };
+    if (prepared.authorKind === "bot") peerBody.metadata = { kind: "bot", source: "slack" };
+    await honchoPost(env, `/v3/workspaces/${encodeURIComponent(ws)}/peers`, peerBody, fetchImpl);
     state.peers.add(prepared.peerId);
   }
   if (!state.sessions.has(prepared.sessionId)) {
@@ -530,7 +566,7 @@ function logSkip(reason, event, opts) {
 function startWrite(env, event, opts) {
   let decision;
   try {
-    decision = decideIngest(event, opts);
+    decision = decideIngest(event, opts.botIds ? opts : { ...opts, botIds: botIngestSetOf(env) });
   } catch (err) {
     (opts.log || console.log)("honcho ingest failed", err?.message || err);
     return null;
