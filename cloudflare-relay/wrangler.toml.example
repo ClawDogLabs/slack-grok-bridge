@@ -65,6 +65,24 @@ HONCHO_WORKSPACE_ID = "slack-workspace"
 # Public channel ids used when channel_type is missing and conversations.info
 # cannot classify (no channels:read). Empty = fail closed. Not a secret.
 HONCHO_CHANNEL_IDS = ""
+# Other bots whose public replies are ingested, besides this bot.
+# Comma-separated bot user ids (U...) and/or bot ids (B...). Unset or empty
+# skips other bots (previous behavior) and does not relabel this bot's own
+# messages. Real ids belong in untracked runtime config.
+# HONCHO_BOT_INGEST_IDS = "UPLACEHOLDER2,BPLACEHOLDER2"
+
+# Optional bot-to-bot forward wake. Off when unset. Some bots only wake on a
+# human tag, so a tag from another bot never reaches them. When a message tags
+# a registered user id, this Worker POSTs kind "forwarded_mention" to that
+# bot's webhook. JSON object, or the short form "U...:PREFIX,U...:PREFIX".
+# "humans": true also forwards human tags. Default is bot-authored tags only.
+# Secrets (npx wrangler secret put, never in this file): <PREFIX>_URL and <PREFIX>_KEY.
+# Example prefix TARGET_WEBHOOK needs TARGET_WEBHOOK_URL and TARGET_WEBHOOK_KEY.
+# Uses the PRIVROOM_STATE binding. Bot-authored forwards are capped per thread
+# at BOT_REPLY_CAP (KV, 7 days). Each ts is forwarded at most once per target
+# (KV, 3 days). Muted channels never forward. Socket Mode does not forward.
+# FORWARD_WAKE = '{"UPLACEHOLDER2":{"secret":"TARGET_WEBHOOK","bot_id":"BPLACEHOLDER2","humans":false}}'
+# FORWARD_WAKE = "UPLACEHOLDER2:TARGET_WEBHOOK"
 
 # Optional wake-path Honcho context. Default off. Independent of HONCHO_INGEST.
 # When "1", processInbound/forwardWatched await session context and attach payload.honcho.
@@ -104,3 +122,6 @@ PRIVROOM_DELAY_SECONDS = "300"
 #   SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, GROK_WEBHOOK_URL, GROK_WEBHOOK_SECRET,
 #   HONCHO_API_KEY   (only when HONCHO_INGEST, HONCHO_READ, or SILENT_RECORD is on;
 #                     omit it while all three are off. Record-only does not use the other two.)
+#   <PREFIX>_URL, <PREFIX>_KEY
+#                     (only when FORWARD_WAKE names that PREFIX. Example:
+#                      TARGET_WEBHOOK_URL and TARGET_WEBHOOK_KEY. Never log them.)

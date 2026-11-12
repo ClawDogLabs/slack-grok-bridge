@@ -18,6 +18,13 @@
  * and forwardWatched await one session context and attach payload.honcho before
  * wakeGrok. A slow or failed read still wakes (honcho.ok === false). See src/honcho.js.
  *
+ * FORWARD_WAKE is optional and off when unset. It names bot user ids that only
+ * wake on a human tag. When a message tags one, this Worker POSTs kind
+ * "forwarded_mention" to that bot's webhook (<PREFIX>_URL and <PREFIX>_KEY).
+ * Bot-authored tags are capped per thread at BOT_REPLY_CAP. Failures are logged
+ * without the URL or key and do not block this relay's own wake. Socket Mode
+ * does not forward. See the README.
+ *
  * Tag-only follow-ups: a mention that is only @mentions and whitespace can pull
  * in the same person's previous message from the last PRIOR_WINDOW_SECONDS (60).
  * The lookup is read-only and fail-open. See findPriorForTagOnly.
@@ -1193,6 +1200,111 @@ async function handle(env, c, e, action) {
   if (action === "watched") return forwardWatched(env, c, event);
 }
 
+// ---------------------------------------------------------------- forward wake
+// Some bots (e.g. a Grok Slack connector) only wake on human tags. FORWARD_WAKE
+// lets this relay POST to such a bot's own webhook when a message tags it.
+// Config (private var), JSON: {"U...":{"secret":"PREFIX","bot_id":"B...","humans":false}}
+// or the short form "U...:PREFIX,U2...:PREFIX2". Secrets: <PREFIX>_URL and <PREFIX>_KEY.
+// Bot-authored tags are capped per thread (BOT_REPLY_CAP) and every ts is
+// forwarded at most once per target (KV). Failures only log; never the URL or key.
+export const FORWARD_WAKE_SUBTYPES = new Set(["bot_message", "file_share", "thread_broadcast", "slack_audio"]);
+const FORWARD_DEDUPE_TTL = 60 * 60 * 24 * 3;
+const FORWARD_CAP_TTL = 60 * 60 * 24 * 7;
+
+export function forwardWakeTargets(env) {
+  const raw = String(env?.FORWARD_WAKE || "").trim();
+  if (!raw) return [];
+  const out = [];
+  const add = (userId, v) => {
+    const o = typeof v === "string" ? { secret: v } : (v && typeof v === "object" ? v : null);
+    if (!/^U[A-Z0-9]+$/.test(String(userId)) || !o || !/^[A-Z][A-Z0-9_]*$/.test(String(o.secret || ""))) return;
+    out.push({ userId: String(userId), secret: String(o.secret), botId: o.bot_id ? String(o.bot_id) : null, humans: o.humans === true });
+  };
+  if (raw.startsWith("{")) {
+    try { for (const [k, v] of Object.entries(JSON.parse(raw))) add(k, v); } catch { log("forward-wake: bad FORWARD_WAKE json"); }
+  } else {
+    for (const part of raw.split(",")) {
+      const [u, pfx] = part.split(":").map((x) => (x || "").trim());
+      if (u && pfx) add(u, pfx);
+    }
+  }
+  return out;
+}
+
+const isBotAuthored = (e) => !!e.bot_id || e.subtype === "bot_message";
+
+/** Pure check. Returns { ok, reason }. */
+export function forwardWakeEligible(e, t, env) {
+  if (!e || e.type !== "message") return { ok: false, reason: "not-message" };
+  if (e.subtype && !FORWARD_WAKE_SUBTYPES.has(e.subtype)) return { ok: false, reason: `subtype:${e.subtype}` };
+  if (e.edited) return { ok: false, reason: "edited" };
+  if (!e.channel || !e.ts) return { ok: false, reason: "no-ts" };
+  if (isSilentEvent(env, e)) return { ok: false, reason: "silent" };
+  if (!String(e.text || "").includes(`<@${t.userId}>`)) return { ok: false, reason: "no-tag" };
+  if (e.user === t.userId || (t.botId && e.bot_id === t.botId)) return { ok: false, reason: "self" };
+  if (!isBotAuthored(e) && !t.humans) return { ok: false, reason: "human-native" };
+  return { ok: true, reason: isBotAuthored(e) ? "bot-tag" : "human-tag" };
+}
+
+export function buildForwardWakePayload(env, e, t, slack) {
+  const threadTs = e.thread_ts || e.ts;
+  return {
+    source: env.BRIDGE_SOURCE || "slack-grok-bridge",
+    kind: "forwarded_mention",
+    forwarded_for: t.userId,
+    slack: { ...slack, bot_id: e.bot_id || null, author_is_bot: isBotAuthored(e) },
+    reply: { channel: e.channel, thread_ts: threadTs, reply_broadcast: false },
+  };
+}
+
+async function forwardWakeOne(env, c, e, t) {
+  const why = forwardWakeEligible(e, t, env);
+  if (!why.ok) return why.reason;
+  const url = env[`${t.secret}_URL`];
+  const key = env[`${t.secret}_KEY`];
+  if (!url || !key) { log("forward-wake skip: missing secret", t.secret, t.userId); return "missing-secret"; }
+  const kv = env?.PRIVROOM_STATE || null;
+  if (!kv) { log("forward-wake skip: no KV", t.userId); return "no-kv"; }
+  const dedupeKey = `fwd:${t.userId}:${e.channel}:${e.ts}`;
+  if (await kv.get(dedupeKey)) { log("forward-wake skip: dup", t.userId, e.channel, e.ts); return "dup"; }
+  const threadTs = e.thread_ts || e.ts;
+  const capKey = `fwdcap:${t.userId}:${e.channel}:${threadTs}`;
+  let n = 0;
+  if (isBotAuthored(e)) {
+    n = Number.parseInt((await kv.get(capKey)) || "0", 10) || 0;
+    if (n >= c.botReplyCap) { log("forward-wake skip: bot cap", t.userId, e.channel, threadTs, n); return "cap"; }
+  }
+  await kv.put(dedupeKey, "1", { expirationTtl: FORWARD_DEDUPE_TTL });
+  if (isBotAuthored(e)) await kv.put(capKey, String(n + 1), { expirationTtl: FORWARD_CAP_TTL });
+  const slack = await summarizeEvent(env, e);
+  const payload = buildForwardWakePayload(env, e, t, slack);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}`, "X-Automation-Key": key },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) { log("forward-wake FAILED", t.userId, e.channel, e.ts, `status=${res.status}`); return "failed"; }
+    log("forward-wake ok", t.userId, e.channel, e.ts, why.reason);
+    return "sent";
+  } catch (err) {
+    log("forward-wake FAILED", t.userId, e.channel, e.ts, err?.name || "error");
+    return "failed";
+  }
+}
+
+/** Runs for every signed message event, separate from this relay's own wake path. */
+export async function forwardWakes(env, c, e) {
+  const targets = forwardWakeTargets(env);
+  if (!targets.length || !e || e.type !== "message") return [];
+  const out = [];
+  for (const t of targets) {
+    out.push(await forwardWakeOne(env, c, e, t).catch((err) => { log("forward-wake error", t.userId, err?.name || "error"); return "error"; }));
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- entry
 const json = (obj, status = 200, extra = {}) =>
   new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json", ...extra } });
@@ -1283,6 +1395,9 @@ export default {
     // HONCHO_READ, when on, runs inside the waitUntil handlers before wakeGrok.
     // message.channels must be subscribed or ordinary public messages never arrive.
     const honchoTask = scheduleHoncho(env, c, e);
+    if (e?.type === "message" && String(env.FORWARD_WAKE || "").trim()) {
+      ctx.waitUntil(forwardWakes(env, c, e).catch((err) => log("forward-wake error", err?.name || "error")));
+    }
     if (action !== "ignore") ctx.waitUntil(handle(env, c, e, action).catch((err) => log("handler error", err?.message || err)));
     if (honchoTask) ctx.waitUntil(honchoTask);
     if (stickyEnabled(env) && env.PRIVROOM_STATE && action === "ignore") {
